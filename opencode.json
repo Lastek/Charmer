@@ -1,0 +1,16 @@
+{
+ "$schema": "https://opencode.ai/config.json",
+  "lsp": {
+    "pyright": {
+      "command": ["pyright", "--stdio"],
+      "env": {
+        "PYRIGHT_PYTHON_PATH": "c:\\dev\\anaconda3\\envs\\media\\python.exe"
+      },
+      "initialization": {
+        "python": {
+          "pythonPath": "c:\\dev\\anaconda3\\envs\\media\\python.exe"
+        }
+      }
+    }
+  }
+}
