@@ -7,6 +7,7 @@ import numpy as np
 import moderngl
 import trimesh
 import os
+import socket
 
 from mediapipe.tasks.python.vision import ImageSegmenter, ImageSegmenterOptions
 try:
@@ -20,6 +21,7 @@ MODEL_PATH = "face_landmarker.task"
 GLB_PATH = "Pirate hat.glb"  # your GLB file
 DENOISE_MODEL_PATH = "dncnn.onnx"
 LANDMARKER_RESULT = None # Reserved variable for the landmarker async callback: landmarkerAsyncCallback 
+APPLY_SMOOTHING = True
 CATEGORY_COLORS = {
     0: (0, 0, 0),  # background - black
     1: (0, 255, 0),  # hair       - green
@@ -191,8 +193,7 @@ class LandmarkSmoother:
         self.filter = OneEuroFilter(min_cutoff=min_cutoff, beta=beta)
 
     def smooth(self, landmarks, shape):
-        h, w = shape
-        points = np.array([[lm.x * w, lm.y * h] for lm in landmarks])
+        points = np.array([[lm.x, lm.y, lm.z] for lm in landmarks])
         t = cv2.getTickCount() / cv2.getTickFrequency()
         return self.filter.filter(points, t)
 
@@ -468,13 +469,18 @@ class GLBRenderer:
 
     def set_facemesh(self, landmarks, shape):
         """Update the facemesh vertices from MediaPipe landmarks."""
-        h, w = shape
         # Convert from pixel space to NDC (-1 to 1)
-        points = np.array([[
-            (lm.x * w / w) * 2 - 1,  # NDC x
-            -((lm.y * h / h) * 2 - 1),  # NDC y (flip Y)
-            lm.z * 2  # scale Z for visibility
-        ] for lm in landmarks], dtype='f4')
+        # points = np.array([[
+        #     (lm.x * w / w) * 2 - 1,  # NDC x
+        #     -((lm.y * h / h) * 2 - 1),  # NDC y (flip Y)
+        #     lm.z * 2  # scale Z for visibility
+        # ] for lm in landmarks], dtype='f4')
+        points = np.column_stack([
+            landmarks[:, 0] *2 -1, #NDC x
+            -(landmarks[:,1] *2 -1), #NDC y (flip Y)
+            landmarks[:, 2] *2 # scale Z for visibility
+        ]).astype('f4')
+
         colors = np.full((len(points), 3), 0.0, dtype='f4')
         colors[:, 1] = 1.0  # green
 
@@ -641,7 +647,7 @@ h, w = frame.shape[:2]
 
 # denoiser = VideoDenoiser(use_onnx=False)
 renderer = GLBRenderer(GLB_PATH, HEAD_PATH, w, h)
-smoother = LandmarkSmoother(min_cutoff=1.0, beta=0.01)
+smoother = LandmarkSmoother(min_cutoff=9.0, beta=0.91)
 segmenter = HeadSegmenter(SEGMENTATION_MODEL)
 
 # _CTYPE_VALUE_MAP = types.MappingProxyType({
@@ -676,14 +682,19 @@ with vision.FaceLandmarker.create_from_options(options) as landmarker:
         landmarker.detect_async(mp_image, time.monotonic_ns()//1_000_000)
         if LANDMARKER_RESULT and LANDMARKER_RESULT.facial_transformation_matrixes:
             results = LANDMARKER_RESULT
-            smoother.smooth(results.face_landmarks[0], (h, w))
+            if APPLY_SMOOTHING:
+                face_landmarks = smoother.smooth(results.face_landmarks[0], (h, w))
+            else:
+                face_landmarks = results.face_landmarks[0]
+            # send to 
             face_matrix = np.array(results.facial_transformation_matrixes[0]).reshape(4, 4)
+            
             # Get segmentation mask
             # head_mask = segmenter.get_head_mask(frame)
             head_mask = None
 
             # print(face_matrix)  # add this
-            frame = renderer.render(frame, face_matrix, head_mask, results.face_landmarks[0])
+            frame = renderer.render(frame, face_matrix, head_mask, face_landmarks)
 
             if DEBUG:
                 original_small = cv2.resize(original, (320, 240))
@@ -692,8 +703,11 @@ with vision.FaceLandmarker.create_from_options(options) as landmarker:
                 cv2.imshow("Denoise Debug", combined)
 
         cv2.imshow("AR 3D Model", frame)
-        if cv2.waitKey(5) & 0xFF == ord("q"):
+        kp = cv2.waitKey(3) & 0xFF
+        if kp == ord("q"):
             break
+        elif kp == ord("s"):
+            APPLY_SMOOTHING ^= True
 
 cap.release()
 cv2.destroyAllWindows()
