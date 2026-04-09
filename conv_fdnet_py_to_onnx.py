@@ -31,6 +31,7 @@ class FFDNet(nn.Module):
         layers['22'] = nn.Conv2d(nc, out_nc*sf*sf, 3, padding=1, bias=True)
         
         self.model = nn.Sequential(layers)
+        nn.Sequential()
         self.m_up = nn.PixelShuffle(upscale_factor=sf)
 
     def forward(self, x, sigma):

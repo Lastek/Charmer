@@ -7,7 +7,8 @@ import numpy as np
 import moderngl
 import trimesh
 import os
-import socket
+# import socket
+import cyndilib
 
 from mediapipe.tasks.python.vision import ImageSegmenter, ImageSegmenterOptions
 try:
@@ -31,6 +32,9 @@ CATEGORY_COLORS = {
     5: (255, 0, 255),  # others     - magenta
 }
 
+UDP_IP = "127.0.0.1"
+UDP_PORT = 4422
+MESSAGE = ""
 class VideoDenoiser:
     """Real-time video denoiser using ONNX Runtime or OpenCV fallback."""
     
@@ -668,6 +672,8 @@ options = vision.FaceLandmarkerOptions(
     result_callback=landmarkerAsyncCallback
 )
 
+# sock =socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
 with vision.FaceLandmarker.create_from_options(options) as landmarker:
     while cap.isOpened():
         ret, frame = cap.read()
@@ -686,9 +692,12 @@ with vision.FaceLandmarker.create_from_options(options) as landmarker:
                 face_landmarks = smoother.smooth(results.face_landmarks[0], (h, w))
             else:
                 face_landmarks = results.face_landmarks[0]
-            # send to 
             face_matrix = np.array(results.facial_transformation_matrixes[0]).reshape(4, 4)
             
+            # send via UDP to UE5
+            #
+            face_mat_flat = face_matrix.flatten().astype(np.float32).tobytes()
+            # sock.sendto(face_mat_flat, (UDP_IP, UDP_PORT))
             # Get segmentation mask
             # head_mask = segmenter.get_head_mask(frame)
             head_mask = None
@@ -703,6 +712,7 @@ with vision.FaceLandmarker.create_from_options(options) as landmarker:
                 cv2.imshow("Denoise Debug", combined)
 
         cv2.imshow("AR 3D Model", frame)
+        
         kp = cv2.waitKey(3) & 0xFF
         if kp == ord("q"):
             break
