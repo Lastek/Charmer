@@ -174,7 +174,7 @@ def generate_single_uap(
     iterations: int,
     resolution: tuple,       # (W, H)
     device: torch.device,
-    seed: int|Nonet = None,
+    seed: int|None = None,
 ) -> np.ndarray:
     """
     Generate one Universal Adversarial Perturbation.
