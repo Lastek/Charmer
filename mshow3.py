@@ -213,13 +213,13 @@ def bone_tree_debug(*bones):
 
 # Attachment locals: constant transforms in head-bone space
 # (MediaPipe canonical face space), rendered against the head-driven view.
-HAT_LOCAL = create_translation_matrix(0, -12.0, 6.0).T
+HAT_LOCAL = create_translation_matrix(0, -14.0, 4.0).T
 HAT_LOCAL[1, 1] = -1  # flip Y axis
 HAT_LOCAL = HAT_LOCAL @ create_rotation_matrix(np.radians(210), 'y')
 
 GHOST_LOCAL = create_scale_matrix(4.4)
-GHOST_LOCAL[1, 3] = -1.0
-GHOST_LOCAL[2, 3] = 6.0
+GHOST_LOCAL[1, 3] = -3.0
+GHOST_LOCAL[2, 3] = 4.0
 
 
 def draw_facemesh(frame, landmarks, color=(0, 255, 0), radius=1):
@@ -334,6 +334,12 @@ class HeadSegmenter:
 
 
 # ── Matrix Stabilizer ─────────────────────────────────────────────
+def shortest_deg(target, current):
+    """Shortest signed angular difference target-current, per component.
+    Wraps at +/-180 so easing always takes the short way around."""
+    return (np.asarray(target) - np.asarray(current) + 180.0) % 360.0 - 180.0
+
+
 class MatrixStabilizer:
     """Stabilizes the facial transformation matrix before it reaches the
     bone tree. All state lives in preallocated buffers (no per-frame allocs
@@ -345,8 +351,10 @@ class MatrixStabilizer:
 
     MIN_CUTOFF = 0.35     # OneEuro: lower = smoother when still (more lag)
     BETA = 0.05           # OneEuro: speed coefficient
-    DEADBAND_CM = 0.15    # output frozen below this filtered delta
+    DEADBAND_CM = 0.15    # creep zone boundary (output eases slowly inside)
     DEADBAND_DEG = 0.4
+    TRACK_RATE_SLOW = 4.0   # 1/s easing rate inside deadband (breathing follow)
+    TRACK_RATE_FAST = 60.0  # 1/s easing rate outside deadband
     GATE_CM = 8.0         # single-frame jump above this = spike -> reject
     GATE_DEG = 25.0
     HOLD_FRAMES = 5       # reject spikes for this many frames, then snap
@@ -372,6 +380,7 @@ class MatrixStabilizer:
         # fixed-size arrays per call; unavoidable with this API and
         # negligible at webcam rates. Upgrade path: manual RPY extraction.
         rpy_raw = Rotation.from_matrix(matrix[:3, :3]).as_euler("xyz", degrees=True)
+        prev_ms = self.last_seen_ms
 
         if self.last_seen_ms is None:
             np.copyto(self.t_state, t_raw)
@@ -391,7 +400,7 @@ class MatrixStabilizer:
             self.r_state *= (1 - decay)
         else:
             jump_t = float(np.linalg.norm(t_raw - self.t_state))
-            jump_r = float(np.abs(rpy_raw - self.r_state).max())
+            jump_r = float(np.abs(shortest_deg(rpy_raw, self.r_state)).max())
             if (jump_t > self.GATE_CM or jump_r > self.GATE_DEG) \
                     and self.hold_count < self.HOLD_FRAMES:
                 self.hold_count += 1          # reject spike, keep last stable
@@ -403,17 +412,24 @@ class MatrixStabilizer:
                 self.trans_filter.filter(t_raw, now_ms / 1000.0, out=self.t_state)
                 self.rot_filter.filter(rpy_raw, now_ms / 1000.0, out=self.r_state)
 
-        self.last_seen_ms = now_ms
-
-        # Deadband: freeze output while the filtered delta stays tiny
+        # Soft tracking: output always eases toward the filtered state.
+        # Inside the deadband it creeps slowly (breathing is followed instead
+        # of frozen -> no snap on exit); outside it closes fast. The easing is
+        # exponential so no transition ever pops. Frame-rate independent.
+        dt_s = min(max(now_ms - prev_ms, 1.0), 200.0) / 1000.0
         d_t = float(np.linalg.norm(self.t_state - self.t_out))
-        d_r = float(np.abs(self.r_state - self.r_out).max())
-        if d_t >= self.DEADBAND_CM or d_r >= self.DEADBAND_DEG:
-            np.copyto(self.t_out, self.t_state)
-            np.copyto(self.r_out, self.r_state)
-            self.out_matrix[:3, 3] = self.t_state
-            self.out_matrix[:3, :3] = Rotation.from_euler(
-                "xyz", self.r_state, degrees=True).as_matrix()
+        r_delta = shortest_deg(self.r_state, self.r_out)
+        d_r = float(np.abs(r_delta).max())
+        rate = self.TRACK_RATE_SLOW \
+            if (d_t < self.DEADBAND_CM and d_r < self.DEADBAND_DEG) \
+            else self.TRACK_RATE_FAST
+        alpha = 1.0 - float(np.exp(-dt_s * rate))
+        self.t_out += (self.t_state - self.t_out) * alpha
+        self.r_out += r_delta * alpha
+        self.out_matrix[:3, 3] = self.t_out
+        self.out_matrix[:3, :3] = Rotation.from_euler(
+            "xyz", self.r_out, degrees=True).as_matrix()
+        self.last_seen_ms = now_ms
         return self.out_matrix
 
 

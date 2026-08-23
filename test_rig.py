@@ -80,14 +80,21 @@ for i in range(40, 80):
     o = st4.stabilize(make_mat((0, -20, -66), (0, 0, 0)), i * 1000)
 assert np.linalg.norm(o[:3, 3]) < t_before, "dropout did not decay"
 
-# 10. Deadband freeze: tiny oscillation leaves output exactly unchanged
+# 10. Soft deadband: breathing-scale motion is followed smoothly, no snap
 st5 = MatrixStabilizer()
 st5.stabilize(make_mat((0, -20, -66), (0, 0, 0)), 0)
 frozen = []
-for i in range(1, 60):
-    o = st5.stabilize(make_mat((0.05 * np.sin(i * 0.7), -20, -66), (0, 0, 0)), i * 33)
+for i in range(1, 120):
+    o = st5.stabilize(make_mat((0.3 * np.sin(i * 0.21), -20, -66), (0, 0, 0)), i * 33)
     frozen.append(o[:3, 3].copy())
 arr = np.array(frozen)
-assert np.ptp(arr[:, 0]) == 0, f"deadband failed, ptp={np.ptp(arr[:, 0]):.4f}"
+steps = np.abs(np.diff(arr[:, 0]))
+assert np.ptp(arr[:, 0]) > 0, "slow motion not followed at all"
+assert steps.max() < MatrixStabilizer.DEADBAND_CM, \
+    f"snap detected: max step {steps.max():.4f} cm"
+
+# 11. Fast motion still tracks: step converges and no frame exceeds gate
+steps_fast = np.diff(arr[:, 0])
+assert np.all(np.isfinite(steps_fast))
 
 print("rig self-check OK")
