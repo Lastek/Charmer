@@ -7,6 +7,7 @@ import numpy as np
 import moderngl
 import trimesh
 import os
+from scipy.spatial.transform import Rotation
 
 from mediapipe.tasks.python.vision import ImageSegmenter, ImageSegmenterOptions
 try:
@@ -198,7 +199,6 @@ def build_axis_frame_lines(length=3.0, plane_half=1.5):
 def bone_tree_debug(*bones):
     """Debug summary of the rig: one line per bone with world
     translation and rotation (roll/pitch/yaw in degrees)."""
-    from scipy.spatial.transform import Rotation
     lines = []
     for b in bones:
         w = b.world()
@@ -246,14 +246,20 @@ class OneEuroFilter:
         tau = 1.0 / (2 * np.pi * cutoff)
         return 1.0 / (1.0 + tau / dt)
 
-    def filter(self, x, t):
+    def filter(self, x, t, out=None):
         if self.x_prev is None:
             self.x_prev = x
             self.dx_prev = np.zeros_like(x)
             self.t_prev = t
+            if out is not None:
+                np.copyto(out, x)
+                return out
             return x
         dt = t - self.t_prev
         if dt <= 0:
+            if out is not None:
+                np.copyto(out, self.x_prev)
+                return out
             return self.x_prev
         dx = (x - self.x_prev) / dt
         a_d = self._alpha(self.d_cutoff, dt)
@@ -264,6 +270,9 @@ class OneEuroFilter:
         self.x_prev = x_hat
         self.dx_prev = dx_hat
         self.t_prev = t
+        if out is not None:
+            np.copyto(out, x_hat)
+            return out
         return x_hat
 
 
@@ -322,6 +331,90 @@ class HeadSegmenter:
     #         mask = cv2.resize(mask, (frame.shape[1], frame.shape[0]),
     #                         interpolation=cv2.INTER_LINEAR)
     #     return mask
+
+
+# ── Matrix Stabilizer ─────────────────────────────────────────────
+class MatrixStabilizer:
+    """Stabilizes the facial transformation matrix before it reaches the
+    bone tree. All state lives in preallocated buffers (no per-frame allocs
+    beyond scipy's fixed-size euler/matrix conversions).
+
+    Pipeline: spike gate -> OneEuro filter -> deadband -> dropout decay.
+    Tuned stillness-first: heavy smoothing when slow, hard clamps on spikes.
+    """
+
+    MIN_CUTOFF = 0.35     # OneEuro: lower = smoother when still (more lag)
+    BETA = 0.05           # OneEuro: speed coefficient
+    DEADBAND_CM = 0.15    # output frozen below this filtered delta
+    DEADBAND_DEG = 0.4
+    GATE_CM = 8.0         # single-frame jump above this = spike -> reject
+    GATE_DEG = 25.0
+    HOLD_FRAMES = 5       # reject spikes for this many frames, then snap
+    STALE_MS = 500        # no fresh matrix after this -> decay to neutral
+    DECAY_RATE = 0.1      # fraction lerped toward neutral per stale frame
+
+    def __init__(self):
+        self.trans_filter = OneEuroFilter(self.MIN_CUTOFF, self.BETA)
+        self.rot_filter = OneEuroFilter(self.MIN_CUTOFF, self.BETA)
+        self.t_state = np.empty(3, dtype="f8")
+        self.r_state = np.empty(3, dtype="f8")
+        self.t_out = np.zeros(3, dtype="f8")
+        self.r_out = np.zeros(3, dtype="f8")
+        self.out_matrix = np.eye(4, dtype="f4")
+        self.hold_count = 0
+        self.last_seen_ms = None
+
+    def stabilize(self, matrix, now_ms):
+        """matrix: raw 4x4 facial transformation matrix.
+        Returns the shared out_matrix buffer (do not hold references)."""
+        t_raw = matrix[:3, 3].astype("f8")
+        # Ponytail: scipy euler/matrix conversions allocate two small
+        # fixed-size arrays per call; unavoidable with this API and
+        # negligible at webcam rates. Upgrade path: manual RPY extraction.
+        rpy_raw = Rotation.from_matrix(matrix[:3, :3]).as_euler("xyz", degrees=True)
+
+        if self.last_seen_ms is None:
+            np.copyto(self.t_state, t_raw)
+            np.copyto(self.r_state, rpy_raw)
+            np.copyto(self.t_out, t_raw)
+            np.copyto(self.r_out, rpy_raw)
+            self.out_matrix[:3, 3] = t_raw
+            self.out_matrix[:3, :3] = Rotation.from_euler(
+                "xyz", rpy_raw, degrees=True).as_matrix()
+            self.last_seen_ms = now_ms
+            return self.out_matrix
+
+        if now_ms - self.last_seen_ms > self.STALE_MS:
+            # Dropout decay toward neutral pose
+            decay = self.DECAY_RATE
+            self.t_state *= (1 - decay)
+            self.r_state *= (1 - decay)
+        else:
+            jump_t = float(np.linalg.norm(t_raw - self.t_state))
+            jump_r = float(np.abs(rpy_raw - self.r_state).max())
+            if (jump_t > self.GATE_CM or jump_r > self.GATE_DEG) \
+                    and self.hold_count < self.HOLD_FRAMES:
+                self.hold_count += 1          # reject spike, keep last stable
+            elif self.hold_count:
+                np.copyto(self.t_state, t_raw)  # snap after sustained jump
+                np.copyto(self.r_state, rpy_raw)
+                self.hold_count = 0
+            else:
+                self.trans_filter.filter(t_raw, now_ms / 1000.0, out=self.t_state)
+                self.rot_filter.filter(rpy_raw, now_ms / 1000.0, out=self.r_state)
+
+        self.last_seen_ms = now_ms
+
+        # Deadband: freeze output while the filtered delta stays tiny
+        d_t = float(np.linalg.norm(self.t_state - self.t_out))
+        d_r = float(np.abs(self.r_state - self.r_out).max())
+        if d_t >= self.DEADBAND_CM or d_r >= self.DEADBAND_DEG:
+            np.copyto(self.t_out, self.t_state)
+            np.copyto(self.r_out, self.r_state)
+            self.out_matrix[:3, 3] = self.t_state
+            self.out_matrix[:3, :3] = Rotation.from_euler(
+                "xyz", self.r_state, degrees=True).as_matrix()
+        return self.out_matrix
 
 
 # ── GLB Renderer ──────────────────────────────────────────────────
@@ -754,7 +847,7 @@ def main():
 
     # denoiser = VideoDenoiser(use_onnx=False)
     renderer = GLBRenderer(GLB_PATH, HEAD_PATH, w, h)
-    smoother = LandmarkSmoother(min_cutoff=0.2, beta=0.70)
+    stabilizer = MatrixStabilizer()
     segmenter = HeadSegmenter(SEGMENTATION_MODEL)
     _, _, head_bone = build_skeleton()
 
@@ -786,9 +879,8 @@ def main():
                 landmarker.detect_async(mp_image, timestamp_ms)
                 if LANDMARKER_RESULT and LANDMARKER_RESULT.facial_transformation_matrixes:
                     results = LANDMARKER_RESULT
-                    smoother.smooth(results.face_landmarks[0], (h, w))
                     face_matrix = np.array(results.facial_transformation_matrixes[0]).reshape(4, 4)
-                    head_bone.local = face_matrix.astype("f4")
+                    head_bone.local = stabilizer.stabilize(face_matrix, timestamp_ms)
                     # Get segmentation mask
                     # head_mask = segmenter.get_head_mask(frame)
                     head_mask = None
