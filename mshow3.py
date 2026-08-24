@@ -213,13 +213,23 @@ def bone_tree_debug(*bones):
 
 # Attachment locals: constant transforms in head-bone space
 # (MediaPipe canonical face space), rendered against the head-driven view.
-HAT_LOCAL = create_translation_matrix(0, -14.0, 4.0).T
+HAT_LOCAL = create_translation_matrix(0, -14.0, 3.0).T
 HAT_LOCAL[1, 1] = -1  # flip Y axis
 HAT_LOCAL = HAT_LOCAL @ create_rotation_matrix(np.radians(210), 'y')
 
 GHOST_LOCAL = create_scale_matrix(4.4)
-GHOST_LOCAL[1, 3] = -3.0
+GHOST_LOCAL[1, 3] = -4.0
 GHOST_LOCAL[2, 3] = 4.0
+
+# Ghost head debug lighting rig (head-local space, canonical face ~10 units
+# tall): warm white key, cool blue fill, amber rim.
+GHOST_LIGHTS_POS = np.array([(7.0, 4.0, 9.0), (-7.0, 2.0, 9.0), (0.0, 9.0, -8.0)], dtype="f4")
+GHOST_LIGHTS_COLOR = np.array([
+    (1.00, 0.95, 0.85),  # key: warm white
+    (0.35, 0.55, 1.00),  # fill: cool blue
+    (1.00, 0.70, 0.30),  # rim: amber
+], dtype="f4")
+GHOST_ALPHA = 0.3
 
 
 def draw_facemesh(frame, landmarks, color=(0, 255, 0), radius=1):
@@ -483,16 +493,37 @@ uniform mat4 u_model;
 uniform mat4 u_view;
 uniform mat4 u_proj;
 in vec3 in_position;
+in vec3 in_normal;
+out vec3 v_normal;
+out vec3 v_frag_pos;
+
 void main() {
-    gl_Position = u_proj * u_view * u_model * vec4(in_position, 1.0);
+    vec4 world_pos = u_model * vec4(in_position, 1.0);
+    v_frag_pos = world_pos.xyz;
+    v_normal = normalize(mat3(u_model) * in_normal);
+    gl_Position = u_proj * u_view * world_pos;
 }
 """
 
 GHOST_FRAG_SHADER = """
 #version 330
+uniform vec3 u_light_pos[3];
+uniform vec3 u_light_color[3];
+uniform float u_alpha;
+in vec3 v_normal;
+in vec3 v_frag_pos;
 out vec4 fragColor;
+
 void main() {
-    fragColor = vec4(0.8, 0.8, 0.8, 0.3);  // invisible but writes depth
+    vec3 N = normalize(v_normal);
+    vec3 total = vec3(0.18);  // ambient
+    for (int i = 0; i < 3; i++) {
+        vec3 L = u_light_pos[i] - v_frag_pos;
+        float dist = length(L);
+        float atten = 1.0 / (1.0 + 0.05 * dist);
+        total += max(dot(N, L / dist), 0.0) * u_light_color[i] * atten;
+    }
+    fragColor = vec4(total, u_alpha);
 }
 """
 
@@ -595,7 +626,8 @@ class GLBRenderer:
 
     def _load_ghost_head(self, path):
         """
-        Load an external head mesh for depth-only occlusion.
+        Load an external head mesh: shaded with a 3-light debug rig when
+        DEBUG, depth-only occluder in production (color mask off).
         Expects a GLB or OBJ file centered roughly at the origin.
         """
         scene = trimesh.load(path, force="scene")
@@ -618,17 +650,35 @@ class GLBRenderer:
 
         verts = merged.vertices.astype("f4")
         faces = merged.faces.astype("i4")
+        merged.fix_normals()
+        normals = merged.vertex_normals.astype("f4")
 
         prog = self.ctx.program(
             vertex_shader=GHOST_VERT_SHADER, fragment_shader=GHOST_FRAG_SHADER
         )
 
         vbo = self.ctx.buffer(verts.tobytes())
+        vbo_n = self.ctx.buffer(normals.tobytes())
         ibo = self.ctx.buffer(faces.tobytes())
 
-        self.ghost_vao = self.ctx.vertex_array(prog, [(vbo, "3f", "in_position")], ibo)
+        self.ghost_vao = self.ctx.vertex_array(
+            prog,
+            [
+                (vbo, "3f", "in_position"),
+                (vbo_n, "3f", "in_normal"),
+            ],
+            ibo,
+        )
         self.ghost_prog = prog
         self.ghost_face_count = faces.size
+
+        # Light rig: positions pre-transformed into ghost world space
+        # (GHOST_LOCAL is constant, so this is done once).
+        lights_h = np.hstack([GHOST_LIGHTS_POS, np.ones((3, 1), dtype="f4")])
+        lights_w = (GHOST_LOCAL @ lights_h.T).T[:, :3].astype("f4")
+        prog["u_light_pos"].write(lights_w.tobytes())
+        prog["u_light_color"].write(GHOST_LIGHTS_COLOR.tobytes())
+        prog["u_alpha"].value = GHOST_ALPHA
 
     def _load_glb(self, path):
         scene = trimesh.load(path, force="scene")
