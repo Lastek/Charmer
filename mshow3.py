@@ -8,7 +8,7 @@ import moderngl
 import trimesh
 import os
 from scipy.spatial.transform import Rotation
-
+import VideoDenoiser
 from mediapipe.tasks.python.vision import ImageSegmenter, ImageSegmenterOptions
 try:
     import onnxruntime as ort
@@ -24,7 +24,8 @@ GLB_PATH = "Pirate hat.glb"  # your GLB file
 HEAD_PATH = "head.glb"
 SEGMENTATION_MODEL = "selfie_multiclass_256x256.tflite"
 DENOISE_MODEL_PATH = "dncnn.onnx"
-LANDMARKER_RESULT = None # Reserved variable for the landmarker async callback: landmarkerAsyncCallback 
+LANDMARKER_RESULT = None # Reserved variable for the landmarker async callback: landmarkerAsyncCallback
+LANDMARKER_RESULT_TS = None  # detection timestamp from the same callback 
 CATEGORY_COLORS = {
     0: (0, 0, 0),  # background - black
     1: (0, 255, 0),  # hair       - green
@@ -33,68 +34,6 @@ CATEGORY_COLORS = {
     4: (255, 255, 0),  # clothes    - cyan
     5: (255, 0, 255),  # others     - magenta
 }
-
-class VideoDenoiser:
-    """Real-time video denoiser using ONNX Runtime or OpenCV fallback."""
-
-    def __init__(self, model_path=None, use_onnx=False):
-        self.model_path = model_path or DENOISE_MODEL_PATH
-        self.use_onnx = use_onnx and ONNX_AVAILABLE
-        self.session = None
-        
-        if self.use_onnx: self._init_onnx()
-        else: print("Using OpenCV fastNlMeansDenoising (ONNX not available)")
-    
-    def _init_onnx(self):
-        """Initialize ONNX Runtime session."""
-        if not os.path.exists(self.model_path):
-            print(f"ONNX model not found at {self.model_path}, falling back to OpenCV")
-            self.use_onnx = False
-            return
-        
-        try:
-            providers = ['CPUExecutionProvider']
-            if 'DmlExecutionProvider' in ort.get_available_providers():
-                providers = ['DmlExecutionProvider', 'CPUExecutionProvider']
-            
-            self.session = ort.InferenceSession(self.model_path, providers=providers)
-            self.input_name = self.session.get_inputs()[0].name
-            print(f"ONNX denoiser loaded from {self.model_path}")
-        except Exception as e:
-            print(f"Failed to load ONNX model: {e}, falling back to OpenCV")
-            self.use_onnx = False
-    
-    def denoise(self, frame):
-        """Denoise a single frame."""
-        if self.use_onnx and self.session is not None:
-            return self._denoise_onnx(frame)
-        return self._denoise_opencv(frame)
-    
-    def _denoise_onnx(self, frame):
-        """Denoise using ONNX model."""
-        h, w = frame.shape[:2]
-        
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        gray = gray.astype(np.float32) / 255.0
-        gray = np.expand_dims(gray, axis=(0, 1))
-        
-        noise_map = np.zeros((1, 1, h, w), dtype=np.float32)
-        
-        input_data = np.concatenate([gray, noise_map], axis=1)
-        
-        output = self.session.run(None, {self.input_name: input_data})[0]
-        
-        denoised = np.squeeze(output) * 255.0
-        denoised = np.clip(denoised, 0, 255).astype(np.uint8)
-        
-        return cv2.cvtColor(denoised, cv2.COLOR_GRAY2BGR)
-    
-    def _denoise_opencv(self, frame):
-        """Denoise using OpenCV fastNlMeansDenoising."""
-        return cv2.fastNlMeansDenoisingColored(
-            frame, None, h=10, hColor=10, 
-            templateWindowSize=7, searchWindowSize=21
-        ) # type: ignore
 
 
 
@@ -213,11 +152,11 @@ def bone_tree_debug(*bones):
 
 # Attachment locals: constant transforms in head-bone space
 # (MediaPipe canonical face space), rendered against the head-driven view.
-HAT_LOCAL = create_translation_matrix(0, -14.0, 3.0).T
+HAT_LOCAL = create_translation_matrix(0, -13.0, 4.0).T@create_scale_matrix(1.3)
 HAT_LOCAL[1, 1] = -1  # flip Y axis
 HAT_LOCAL = HAT_LOCAL @ create_rotation_matrix(np.radians(210), 'y')
 
-GHOST_LOCAL = create_scale_matrix(4.4)
+GHOST_LOCAL = create_scale_matrix(4.2)
 GHOST_LOCAL[1, 3] = -4.0
 GHOST_LOCAL[2, 3] = 4.0
 
@@ -344,19 +283,21 @@ class HeadSegmenter:
 
 
 # ── Matrix Stabilizer ─────────────────────────────────────────────
-def shortest_deg(target, current):
-    """Shortest signed angular difference target-current, per component.
-    Wraps at +/-180 so easing always takes the short way around."""
-    return (np.asarray(target) - np.asarray(current) + 180.0) % 360.0 - 180.0
-
-
 class MatrixStabilizer:
     """Stabilizes the facial transformation matrix before it reaches the
     bone tree. All state lives in preallocated buffers (no per-frame allocs
-    beyond scipy's fixed-size euler/matrix conversions).
+    beyond scipy's fixed-size conversions).
 
-    Pipeline: spike gate -> OneEuro filter -> deadband -> dropout decay.
+    Rotation is tracked as a rotation vector (axis-angle, degrees): branch
+    free up to 180 deg total rotation, unlike euler which flips its
+    decomposition near +/-90 deg pitch/yaw and wraps at 180.
+
+    Pipeline: spike gate -> OneEuro filter -> soft tracking -> dropout decay.
     Tuned stillness-first: heavy smoothing when slow, hard clamps on spikes.
+    Ponytail (Gemini review, rejected): quaternion SLERP output easing —
+    per-frame deltas here are sub-degree so curvature is invisible, and
+    scipy Slerp allocates per frame; spherical deadband — max/norm metric
+    anisotropy is bounded by ~1.7x at a 0.4 deg scale, imperceptible.
     """
 
     MIN_CUTOFF = 0.35     # OneEuro: lower = smoother when still (more lag)
@@ -368,8 +309,9 @@ class MatrixStabilizer:
     GATE_CM = 8.0         # single-frame jump above this = spike -> reject
     GATE_DEG = 25.0
     HOLD_FRAMES = 5       # reject spikes for this many frames, then snap
-    STALE_MS = 500        # no fresh matrix after this -> decay to neutral
-    DECAY_RATE = 0.1      # fraction lerped toward neutral per stale frame
+    STALE_MS = 500        # detection older than this -> decay to neutral
+    DECAY_RATE = 0.1      # fraction eased toward neutral per stale frame
+    NEUTRAL_T = np.array([0.0, 0.0, -60.0])  # decay target, NOT the lens (0,0,0)
 
     def __init__(self):
         self.trans_filter = OneEuroFilter(self.MIN_CUTOFF, self.BETA)
@@ -382,45 +324,47 @@ class MatrixStabilizer:
         self.hold_count = 0
         self.last_seen_ms = None
 
-    def stabilize(self, matrix, now_ms):
+    def stabilize(self, matrix, now_ms, last_detect_ms=None):
         """matrix: raw 4x4 facial transformation matrix.
+        last_detect_ms: timestamp of the detection the matrix came from
+                        (None = treat as fresh).
         Returns the shared out_matrix buffer (do not hold references)."""
         t_raw = matrix[:3, 3].astype("f8")
-        # Ponytail: scipy euler/matrix conversions allocate two small
-        # fixed-size arrays per call; unavoidable with this API and
-        # negligible at webcam rates. Upgrade path: manual RPY extraction.
-        rpy_raw = Rotation.from_matrix(matrix[:3, :3]).as_euler("xyz", degrees=True)
+        # Ponytail: scipy conversions allocate two small fixed-size arrays
+        # per call; negligible at webcam rates.
+        rv_raw = np.degrees(Rotation.from_matrix(matrix[:3, :3]).as_rotvec())
         prev_ms = self.last_seen_ms
 
-        if self.last_seen_ms is None:
+        if prev_ms is None:
             np.copyto(self.t_state, t_raw)
-            np.copyto(self.r_state, rpy_raw)
+            np.copyto(self.r_state, rv_raw)
             np.copyto(self.t_out, t_raw)
-            np.copyto(self.r_out, rpy_raw)
+            np.copyto(self.r_out, rv_raw)
             self.out_matrix[:3, 3] = t_raw
-            self.out_matrix[:3, :3] = Rotation.from_euler(
-                "xyz", rpy_raw, degrees=True).as_matrix()
+            self.out_matrix[:3, :3] = matrix[:3, :3]
             self.last_seen_ms = now_ms
             return self.out_matrix
 
-        if now_ms - self.last_seen_ms > self.STALE_MS:
-            # Dropout decay toward neutral pose
-            decay = self.DECAY_RATE
-            self.t_state *= (1 - decay)
-            self.r_state *= (1 - decay)
+        is_stale = (last_detect_ms is not None
+                    and now_ms - last_detect_ms > self.STALE_MS)
+        if is_stale:
+            # Dropout: ease toward neutral pose. NEUTRAL_T keeps Z at a sane
+            # head distance; decaying to origin would dive into the lens.
+            self.t_state -= (self.t_state - self.NEUTRAL_T) * self.DECAY_RATE
+            self.r_state *= (1 - self.DECAY_RATE)
         else:
             jump_t = float(np.linalg.norm(t_raw - self.t_state))
-            jump_r = float(np.abs(shortest_deg(rpy_raw, self.r_state)).max())
+            jump_r = float(np.linalg.norm(rv_raw - self.r_state))
             if (jump_t > self.GATE_CM or jump_r > self.GATE_DEG) \
                     and self.hold_count < self.HOLD_FRAMES:
                 self.hold_count += 1          # reject spike, keep last stable
             elif self.hold_count:
                 np.copyto(self.t_state, t_raw)  # snap after sustained jump
-                np.copyto(self.r_state, rpy_raw)
+                np.copyto(self.r_state, rv_raw)
                 self.hold_count = 0
             else:
                 self.trans_filter.filter(t_raw, now_ms / 1000.0, out=self.t_state)
-                self.rot_filter.filter(rpy_raw, now_ms / 1000.0, out=self.r_state)
+                self.rot_filter.filter(rv_raw, now_ms / 1000.0, out=self.r_state)
 
         # Soft tracking: output always eases toward the filtered state.
         # Inside the deadband it creeps slowly (breathing is followed instead
@@ -428,8 +372,8 @@ class MatrixStabilizer:
         # exponential so no transition ever pops. Frame-rate independent.
         dt_s = min(max(now_ms - prev_ms, 1.0), 200.0) / 1000.0
         d_t = float(np.linalg.norm(self.t_state - self.t_out))
-        r_delta = shortest_deg(self.r_state, self.r_out)
-        d_r = float(np.abs(r_delta).max())
+        r_delta = self.r_state - self.r_out
+        d_r = float(np.linalg.norm(r_delta))  # rotvec norm == angle in deg
         rate = self.TRACK_RATE_SLOW \
             if (d_t < self.DEADBAND_CM and d_r < self.DEADBAND_DEG) \
             else self.TRACK_RATE_FAST
@@ -437,8 +381,8 @@ class MatrixStabilizer:
         self.t_out += (self.t_state - self.t_out) * alpha
         self.r_out += r_delta * alpha
         self.out_matrix[:3, 3] = self.t_out
-        self.out_matrix[:3, :3] = Rotation.from_euler(
-            "xyz", self.r_out, degrees=True).as_matrix()
+        self.out_matrix[:3, :3] = Rotation.from_rotvec(
+            np.radians(self.r_out)).as_matrix()
         self.last_seen_ms = now_ms
         return self.out_matrix
 
@@ -901,8 +845,9 @@ class GLBRenderer:
 # ── Main ──────────────────────────────────────────────────────────
 def landmarkerAsyncCallback(result: vision.FaceLandmarkerResult,
                     unused_output_image: mp.Image, timestamp_ms: int):
-    global LANDMARKER_RESULT
+    global LANDMARKER_RESULT, LANDMARKER_RESULT_TS
     LANDMARKER_RESULT = result
+    LANDMARKER_RESULT_TS = timestamp_ms
 
 
 def main():
@@ -946,7 +891,7 @@ def main():
                 if LANDMARKER_RESULT and LANDMARKER_RESULT.facial_transformation_matrixes:
                     results = LANDMARKER_RESULT
                     face_matrix = np.array(results.facial_transformation_matrixes[0]).reshape(4, 4)
-                    head_bone.local = stabilizer.stabilize(face_matrix, timestamp_ms)
+                    head_bone.local = stabilizer.stabilize(face_matrix, timestamp_ms, LANDMARKER_RESULT_TS)
                     # Get segmentation mask
                     # head_mask = segmenter.get_head_mask(frame)
                     head_mask = None

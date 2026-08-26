@@ -71,14 +71,17 @@ for i in range(400):
 assert np.linalg.norm(o[:3, 3] - (10, -20, -66)) < 0.5, \
     f"no convergence: {o[:3, 3]}"
 
-# 9. Dropout decay: stale timestamps shrink translation toward neutral
+# 9. Dropout decay: stale detection eases toward NEUTRAL_T, not the lens
 st4 = MatrixStabilizer()
 for i in range(30):
-    o = st4.stabilize(make_mat((0, -20, -66), (0, 0, 0)), i * 33)
-t_before = np.linalg.norm(o[:3, 3])
+    o = st4.stabilize(make_mat((15, -20, -66), (0, 0, 0)), i * 33, i * 33)
+t_before = o[:3, 3].copy()
+detect_ts = 30 * 33  # detection frozen here
 for i in range(40, 80):
-    o = st4.stabilize(make_mat((0, -20, -66), (0, 0, 0)), i * 1000)
-assert np.linalg.norm(o[:3, 3]) < t_before, "dropout did not decay"
+    o = st4.stabilize(make_mat((15, -20, -66), (0, 0, 0)), i * 1000, detect_ts)
+assert abs(o[0, 3]) < abs(t_before[0]), "x did not decay toward neutral"
+assert abs(o[2, 3] + 60) < abs(t_before[2] + 60), "z did not ease toward -60"
+assert o[2, 3] < -40, f"dived toward lens: z={o[2, 3]:.1f}"
 
 # 10. Soft deadband: breathing-scale motion is followed smoothly, no snap
 st5 = MatrixStabilizer()
@@ -96,5 +99,22 @@ assert steps.max() < MatrixStabilizer.DEADBAND_CM, \
 # 11. Fast motion still tracks: step converges and no frame exceeds gate
 steps_fast = np.diff(arr[:, 0])
 assert np.all(np.isfinite(steps_fast))
+
+# 12. Rotation continuity through steep yaw: rotvec channel stays smooth
+# (pre-rotvec euler blew out ~25 deg/frame near the 90 deg branch flip)
+st7 = MatrixStabilizer()
+rv_steps = []
+prev_rv = None
+for i in range(58):
+    ang = -170.0 + i * 6.0          # sweeps -170 -> +178, stays under 180
+    o = st7.stabilize(make_mat((0, -20, -66), (0.0, ang, 0.0)), i * 33, i * 33)
+    rv = np.degrees(Rotation.from_matrix(o[:3, :3]).as_rotvec())
+    if prev_rv is not None:
+        rv_steps.append(float(np.linalg.norm(rv - prev_rv)))
+    prev_rv = rv
+max_step = max(rv_steps)
+assert max_step < 8.0, f"rotation blew through: {max_step:.2f} deg/frame"
+
+print("rig self-check OK")
 
 print("rig self-check OK")
