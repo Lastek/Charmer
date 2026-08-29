@@ -8,7 +8,6 @@ import moderngl
 import trimesh
 import os
 from scipy.spatial.transform import Rotation
-import VideoDenoiser
 from mediapipe.tasks.python.vision import ImageSegmenter, ImageSegmenterOptions
 try:
     import onnxruntime as ort
@@ -25,15 +24,7 @@ HEAD_PATH = "head.glb"
 SEGMENTATION_MODEL = "selfie_multiclass_256x256.tflite"
 DENOISE_MODEL_PATH = "dncnn.onnx"
 LANDMARKER_RESULT = None # Reserved variable for the landmarker async callback: landmarkerAsyncCallback
-LANDMARKER_RESULT_TS = None  # detection timestamp from the same callback 
-CATEGORY_COLORS = {
-    0: (0, 0, 0),  # background - black
-    1: (0, 255, 0),  # hair       - green
-    2: (255, 0, 0),  # body skin  - blue
-    3: (0, 0, 255),  # face skin  - red
-    4: (255, 255, 0),  # clothes    - cyan
-    5: (255, 0, 255),  # others     - magenta
-}
+LANDMARKER_RESULT_TS = None  # detection timestamp from the same callback
 
 
 
@@ -169,6 +160,19 @@ GHOST_LIGHTS_COLOR = np.array([
     (1.00, 0.70, 0.30),  # rim: amber
 ], dtype="f4")
 GHOST_ALPHA = 0.3
+
+# ── Holographic screen plane ────────────────────────────────────────
+# A flat, semi-opaque quad in the SAME NDC space as the facemesh points
+# (identity view/proj). Its model matrix is built from the head_bone
+# world rotation, offset +1 along the bone's local Z. Points behind the
+# plane fade out, so it reads as a "holographic screen" holding the
+# facemesh points. PLANE_* / HOLO_COLOR are the single place the styling
+# pass tunes later.
+PLANE_HALF = 0.9        # half-extent of the quad in local XY
+PLANE_OFFSET_Z = 1.0    # quad lives this far in front of the face mesh
+FADE_RANGE = 0.2        # soft depth band: points > this far behind vanish
+HOLO_COLOR = (0.20, 0.55, 0.75, 0.20)   # faded blue-cyan, semitransparent
+PLANE_ZEROS = (0.0, 0.0, 0.0)
 
 
 def draw_facemesh(frame, landmarks, color=(0, 255, 0), radius=1):
@@ -477,27 +481,57 @@ uniform mat4 u_view;
 uniform mat4 u_proj;
 uniform mat4 u_model;
 uniform float u_point_size;
+uniform vec3 u_plane_point;
+uniform vec3 u_plane_normal;
+uniform float u_fade_range;
 
 in vec3 in_position;
 in vec3 in_color;
 
 out vec3 v_color;
+out float v_fade;
 
 void main() {
     vec4 world_pos = u_model * vec4(in_position, 1.0);
     gl_Position = u_proj * u_view * world_pos;
     gl_PointSize = u_point_size;
     v_color = in_color;
+    float d = dot(world_pos.xyz - u_plane_point, u_plane_normal);
+    v_fade = clamp(d, 0.0, u_fade_range) / u_fade_range;
 }
 """
 
 POINT_FRAG_SHADER = """
 #version 330
 in vec3 v_color;
+in float v_fade;
 out vec4 fragColor;
 
 void main() {
-    fragColor = vec4(v_color, 1.0);
+    fragColor = vec4(v_color, v_fade);
+}
+"""
+
+HOLO_PLANE_VERT_SHADER = """
+#version 330
+uniform mat4 u_model;
+uniform mat4 u_view;
+uniform mat4 u_proj;
+
+in vec3 in_position;
+
+void main() {
+    gl_Position = u_proj * u_view * u_model * vec4(in_position, 1.0);
+}
+"""
+
+HOLO_PLANE_FRAG_SHADER = """
+#version 330
+uniform vec4 u_color;
+out vec4 fragColor;
+
+void main() {
+    fragColor = u_color;
 }
 """
 
@@ -532,10 +566,18 @@ class GLBRenderer:
         self.ctx = moderngl.create_standalone_context()
         self.width = width
         self.height = height
+        # Runtime view toggles (flip live from a UI without rebuilding)
+        self.show_facemesh = True
+        self.show_hologram = True       # holographic screen plane in front of facemesh
+        self.show_axes = DEBUG          # TNB axis/plane debug lines
+        self.ghost_shaded = DEBUG       # shaded ghost rig vs depth-only occluder
+        self.last_fbo = None            # raw FBO RGB (pre-mask, pre-composite)
         self.meshes = []  # list of (vao, prog, index_count)
         self._setup_fbo(width, height)
-        self._load_glb(glb_path)
-        self._load_ghost_head(head_path)
+        # self._load_glb(glb_path)
+        self._load_glb('blank.glb')
+        # self._load_ghost_head(head_path)
+        self._load_ghost_head('blank.glb')
         self._setup_point_shader()
         self.facemesh_vbo = None
         self.facemesh_vao = None
@@ -561,6 +603,23 @@ class GLBRenderer:
         )
         self.debug_vert_count = len(dv)
 
+        # Holographic screen plane: a 2x2 triangle strip in local XY, offset
+        # +u in front of the head_bone via the bone's world matrix at render.
+        self.holo_prog = self.ctx.program(
+            vertex_shader=HOLO_PLANE_VERT_SHADER, fragment_shader=HOLO_PLANE_FRAG_SHADER
+        )
+        ph = PLANE_HALF
+        holo_verts = np.array([
+            (-ph, -ph, PLANE_OFFSET_Z),
+            (-ph,  ph, PLANE_OFFSET_Z),
+            ( ph, -ph, PLANE_OFFSET_Z),
+            ( ph,  ph, PLANE_OFFSET_Z),
+        ], dtype="f4")
+        self.holo_vbo = self.ctx.buffer(holo_verts.tobytes())
+        self.holo_vao = self.ctx.vertex_array(
+            self.holo_prog, [(self.holo_vbo, "3f", "in_position")]
+        )
+
     def _setup_fbo(self, w, h):
         self.color_tex = self.ctx.texture((w, h), 4)
         self.depth_buf = self.ctx.depth_renderbuffer((w, h))
@@ -574,6 +633,7 @@ class GLBRenderer:
         DEBUG, depth-only occluder in production (color mask off).
         Expects a GLB or OBJ file centered roughly at the origin.
         """
+        scene = trimesh.load(path, force="scene")
         scene = trimesh.load(path, force="scene")
         raw_meshes = flatten_scene_meshes(scene)
 
@@ -700,8 +760,9 @@ class GLBRenderer:
             lm.z * 2  # scale Z for visibility
         ] for lm in landmarks], dtype='f4')
         colors = np.full((len(points), 3), 0.0, dtype='f4')
-        colors[:, 1] = 1.0  # green
-
+        colors[:, 0] = 0.8
+        colors[:, 1] = 0.9  # green
+        colors[:, 2] = 0.1
         vbo = self.ctx.buffer(points.tobytes())
         vbo_color = self.ctx.buffer(colors.tobytes())
 
@@ -757,16 +818,11 @@ class GLBRenderer:
 
         proj = self._make_projection()
         normal_mat = np.linalg.inv(model[:3, :3]).T
-        # ── Step 1: Render ghost head (depth only, no color) ──────────
+        # ── Step 1: Render ghost head ──────────────────────────────────
+        # Shaded 3-light debug rig when ghost_shaded; otherwise depth-only
+        # occluder (color writes off, restored after the draw).
         ghost_model = GHOST_LOCAL
-        if DEBUG:
-            # Draw wireframe in color for FBO debug window
-            pass
-            # self.ctx.wireframe = True
-            # self.ctx.color_mask = True, True, True, True
-        else:
-            # Depth only in production
-            self.ctx.wireframe = False
+        if not self.ghost_shaded:
             self.ctx.color_mask = False, False, False, False
 
         self.ghost_prog["u_model"].write(ghost_model.T.tobytes())
@@ -775,8 +831,7 @@ class GLBRenderer:
         self.ghost_vao.render()
         self.ctx.color_mask = True, True, True, True
 
-        self.ctx.wireframe = False
-        # ── Step 2: Render hat (depth tested against ghost head) ──────
+        # ── Step 2: Render hat (depth tested against ghost head) ───────
         for vao, prog, _ in self.meshes:
             prog["u_model"].write(model.T.tobytes())
             prog["u_view"].write(view.T.tobytes())
@@ -787,8 +842,8 @@ class GLBRenderer:
             prog["u_ambient"].value = (0.3, 0.3, 0.3)
             vao.render()
 
-        # ── Debug: TNB axes + planes at bone origins (no depth test) ─
-        if DEBUG:
+        # ── Debug: TNB axes + planes at bone origins (no depth test) ──
+        if self.show_axes:
             self.ctx.disable(moderngl.DEPTH_TEST)
             identity = np.eye(4, dtype="f4")
             self.debug_prog["u_model"].write(identity.T.tobytes())
@@ -797,7 +852,8 @@ class GLBRenderer:
             self.debug_vao.render(moderngl.LINES)
             self.ctx.enable(moderngl.DEPTH_TEST)
 
-        # ── Step 3: Render facemesh points via GL ─────────────────────        if face_landmarks is not None:
+        # ── Step 3: Render facemesh points via GL ─────────────────────
+        if face_landmarks is not None and self.show_facemesh:
             self.set_facemesh(face_landmarks, (self.height, self.width))
             # Points are already in NDC, use identity matrices
             identity = np.eye(4, dtype='f4')
@@ -805,28 +861,51 @@ class GLBRenderer:
             self.point_prog["u_view"].write(identity.T.tobytes())
             self.point_prog["u_proj"].write(identity.T.tobytes())
             self.point_prog["u_point_size"].value = 3.0
+
+            # Holographic screen (POC): the visible plane is rendered in
+            # camera space — through the same view/proj as the ghost head —
+            # with an identity model (the +PLANE_OFFSET_Z is baked into the
+            # quad vertices), so it tracks the head's real 3D position.
+            # The plane geometry for the point fade is still derived from the
+            # head_bone rotation in the points' NDC frame, so the fade reacts
+            # to head orientation even though points don't share camera space.
+            holo_model = np.eye(4, dtype="f4")
+            holo_model[:3, :3] = head_world[:3, :3]
+            plane_origin = (holo_model @ np.array(
+                [0.0, 0.0, PLANE_OFFSET_Z, 1.0])).astype("f4")
+            plane_normal = (holo_model @ np.array(
+                [0.0, 0.0, 1.0, 0.0])).astype("f4")
+            self.point_prog["u_plane_point"].write(plane_origin[:3].tobytes())
+            self.point_prog["u_plane_normal"].write(plane_normal[:3].tobytes())
+            self.point_prog["u_fade_range"].value = FADE_RANGE
+
+            if self.show_hologram:
+                self.holo_prog["u_model"].write(identity.T.tobytes())
+                self.holo_prog["u_view"].write(view.T.tobytes())
+                self.holo_prog["u_proj"].write(proj.T.tobytes())
+                self.holo_prog["u_color"].value = HOLO_COLOR
+                self.holo_vao.render(moderngl.TRIANGLE_STRIP)
+
             self.facemesh_vao.render(moderngl.POINTS)
 
         # ── Read pixels and composite ─────────────────────────────
         raw = self.fbo.read(components=4)
         img = np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 4)
         img = np.flipud(img).copy()  # OpenGL origin is bottom-left
+        self.last_fbo = img[:, :, :3].copy()  # raw FBO RGB for the FBO Debug view
 
         # ── Step 4: Apply segmentation mask ──────────────────────────
         if head_mask is not None:
             head_region = (head_mask > 128).squeeze().astype(np.uint8)
             img[:, :, 3] = img[:, :, 3] * (1 - head_region)
-
-        result = composite_frame(frame, img)
-
-        if DEBUG == True:
+        if DEBUG:
             # in render(), replace the composite block at the bottom with this temporarily:
             # raw = self.fbo.read(components=4)
             # img = np.frombuffer(raw, dtype=np.uint8).reshape(self.height, self.width, 4)
             # img = np.flipud(img)
-            debug = img[:, :, :3].copy()  # just RGB, no composite
+            # fbo_debug = img[:, :, :3].copy()  # just RGB, no composite
             # Facemesh is now rendered via GL pipeline above
-            cv2.imshow("FBO Debug", debug)
+            # cv2.imshow("FBO Debug", fbo_debug)
             # DEBUG: Visualize all segmentation categories with different colors
             if head_mask is not None:
                 mp_image = create_mediapipe_image(frame)
@@ -836,8 +915,10 @@ class GLBRenderer:
                 for cat_id, color in CATEGORY_COLORS.items():
                     cat_vis[category == cat_id] = color
                 cat_vis = cv2.resize(cat_vis, (frame.shape[1], frame.shape[0]))
-                cv2.imshow("Category Debug", cat_vis)
+                # cv2.imshow("Category Debug", cat_vis)
                 # return frame  # return frame unchanged
+
+        result = composite_frame(frame, img)
 
         return result
 
@@ -856,7 +937,6 @@ def main():
     ret, frame = cap.read()
     h, w = frame.shape[:2]
 
-    # denoiser = VideoDenoiser(use_onnx=False)
     renderer = GLBRenderer(GLB_PATH, HEAD_PATH, w, h)
     stabilizer = MatrixStabilizer()
     segmenter = HeadSegmenter(SEGMENTATION_MODEL)
@@ -881,10 +961,7 @@ def main():
                 ret, frame = cap.read()
                 if not ret:
                     break
-
                 original = frame.copy()
-                # frame = denoiser.denoise(frame)
-
                 mp_image = create_mediapipe_image(frame)
                 timestamp_ms = time.monotonic_ns()//1_000_000
                 landmarker.detect_async(mp_image, timestamp_ms)
@@ -897,7 +974,7 @@ def main():
                     head_mask = None
 
                     frame = renderer.render(frame, head_bone.world(), head_mask, results.face_landmarks[0])
-
+                    fbo_debug = renderer.last_fbo
                     frame_count += 1
                     if DEBUG and frame_count % 30 == 0:
                         print(bone_tree_debug(head_bone))
@@ -907,14 +984,33 @@ def main():
                         denoised_debug = cv2.resize(frame, (320, 240))
                         combined = np.hstack([original_small, denoised_debug])
                         cv2.imshow("Denoise Debug", combined)
+                        cv2.imshow("FBO", fbo_debug)
 
                 cv2.imshow("AR 3D Model", frame)
                 if cv2.waitKey(5) & 0xFF == ord("q"):
                     break
     finally:
-        cap.release()
         cv2.destroyAllWindows()
+        cap.release()
+
+
+def _check_hologram_fade():
+    """Self-check: mirrors POINT_VERT_SHADER's signed-distance fade so the
+    plane math survives a refactor without running the webcam."""
+    import numpy as _np
+    # Unit rotation (identity) head + plane at +1 on z.
+    rot = _np.eye(4)
+    plane_point = (rot @ _np.array([0.0, 0.0, PLANE_OFFSET_Z, 1.0]))[:3]
+    plane_normal = (rot @ _np.array([0.0, 0.0, 1.0, 0.0]))[:3]
+    rng = FADE_RANGE
+    fade = lambda p: _np.clip(
+        _np.dot(p[:3] - plane_point, plane_normal), 0.0, rng) / rng
+    assert fade([0.0, 0.0, 2.0]) == 1.0, "point in front should be fully lit"
+    assert fade([0.0, 0.0, 0.0]) == 0.0, "point behind plane should vanish"
+    assert 0.0 <= fade([0.0, 0.0, 1.0]) <= 1.0, "on-plane point in range"
+    print("hologram fade check: OK")
 
 
 if __name__ == "__main__":
+    _check_hologram_fade()
     main()
