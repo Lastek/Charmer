@@ -161,18 +161,25 @@ GHOST_LIGHTS_COLOR = np.array([
 ], dtype="f4")
 GHOST_ALPHA = 0.3
 
-# ── Holographic screen plane ────────────────────────────────────────
-# A flat, semi-opaque quad in the SAME NDC space as the facemesh points
-# (identity view/proj). Its model matrix is built from the head_bone
-# world rotation, offset +1 along the bone's local Z. Points behind the
-# plane fade out, so it reads as a "holographic screen" holding the
-# facemesh points. PLANE_* / HOLO_COLOR are the single place the styling
-# pass tunes later.
-PLANE_HALF = 0.9        # half-extent of the quad in local XY
-PLANE_OFFSET_Z = 1.0    # quad lives this far in front of the face mesh
-FADE_RANGE = 0.2        # soft depth band: points > this far behind vanish
-HOLO_COLOR = (0.20, 0.55, 0.75, 0.20)   # faded blue-cyan, semitransparent
-PLANE_ZEROS = (0.0, 0.0, 0.0)
+# ── Holographic portrait panel ──────────────────────────────────────
+# Game-style comms portrait: the facemesh point cloud is rendered as 3D
+# into an offscreen portrait FBO (head rotation drives the model matrix,
+# a fixed portrait camera looks at the face), then the texture is drawn
+# on a fixed screen-space panel quad with holo styling (scanlines, rim
+# glow, flicker). Two spaces, never mixed: 3D model space inside the
+# portrait pass, raw NDC in the panel pass.
+PORTRAIT_RES = 384                          # square offscreen FBO size
+PANEL_RECT = (0.35, -0.95, 0.95, 0.35)      # NDC: left, bottom, right, top
+PORTRAIT_CAM_DIST = 3.5                     # portrait camera distance
+PORTRAIT_FOV = 60.0
+HOLO_TINT = (0.30, 0.80, 1.00)
+PANEL_BASE_ALPHA = 0.08
+PORTRAIT_POINT_SIZE = 4.0
+
+# MP -> portrait basis change (y down/z in -> y up/z out). Ponytail:
+# chirality verified by eye, not derived from a spec; if the portrait
+# turns mirrored, flip signs on this diagonal only.
+MP_TO_PORTRAIT = np.diag([1.0, -1.0, -1.0, 1.0]).astype("f4")
 
 
 def draw_facemesh(frame, landmarks, color=(0, 255, 0), radius=1):
@@ -481,57 +488,71 @@ uniform mat4 u_view;
 uniform mat4 u_proj;
 uniform mat4 u_model;
 uniform float u_point_size;
-uniform vec3 u_plane_point;
-uniform vec3 u_plane_normal;
-uniform float u_fade_range;
 
 in vec3 in_position;
 in vec3 in_color;
 
 out vec3 v_color;
-out float v_fade;
 
 void main() {
-    vec4 world_pos = u_model * vec4(in_position, 1.0);
-    gl_Position = u_proj * u_view * world_pos;
+    gl_Position = u_proj * u_view * u_model * vec4(in_position, 1.0);
     gl_PointSize = u_point_size;
     v_color = in_color;
-    float d = dot(world_pos.xyz - u_plane_point, u_plane_normal);
-    v_fade = clamp(d, 0.0, u_fade_range) / u_fade_range;
 }
 """
 
 POINT_FRAG_SHADER = """
 #version 330
 in vec3 v_color;
-in float v_fade;
 out vec4 fragColor;
 
 void main() {
-    fragColor = vec4(v_color, v_fade);
+    // round, soft-edged point sprite
+    float d = length(gl_PointCoord - 0.5) * 2.0;
+    float a = smoothstep(1.0, 0.5, d);
+    fragColor = vec4(v_color, a);
 }
 """
 
-HOLO_PLANE_VERT_SHADER = """
+HOLO_SCREEN_VERT_SHADER = """
 #version 330
-uniform mat4 u_model;
-uniform mat4 u_view;
-uniform mat4 u_proj;
-
-in vec3 in_position;
+in vec2 in_position;   // fixed NDC quad corners (PANEL_RECT)
+in vec2 in_uv;
+out vec2 v_uv;
 
 void main() {
-    gl_Position = u_proj * u_view * u_model * vec4(in_position, 1.0);
+    v_uv = in_uv;
+    gl_Position = vec4(in_position, 0.0, 1.0);
 }
 """
 
-HOLO_PLANE_FRAG_SHADER = """
+HOLO_SCREEN_FRAG_SHADER = """
 #version 330
-uniform vec4 u_color;
+uniform sampler2D u_holo_tex;
+uniform float u_time;
+uniform vec3 u_tint;
+uniform float u_base_alpha;
+
+in vec2 v_uv;
 out vec4 fragColor;
 
 void main() {
-    fragColor = u_color;
+    vec4 content = texture(u_holo_tex, v_uv);
+    float lum = dot(content.rgb, vec3(0.299, 0.587, 0.114));
+
+    float scan    = 0.85 + 0.15 * sin(v_uv.y * 300.0 - u_time * 6.0);
+    float flicker = 0.92 + 0.08 * sin(u_time * 47.0) * sin(u_time * 13.7);
+
+    vec2  to_edge = min(v_uv, 1.0 - v_uv);
+    float edge    = min(to_edge.x, to_edge.y);
+    float border  = smoothstep(0.015, 0.0, edge);   // hard rim line
+    float glow    = smoothstep(0.10, 0.0, edge);    // soft inner falloff
+
+    vec3 col = u_tint * lum * scan * flicker
+             + u_tint * (border * 0.9 + glow * 0.20);
+    float alpha = clamp(lum * content.a * scan
+                        + u_base_alpha * glow + border * 0.6, 0.0, 1.0);
+    fragColor = vec4(col, alpha);
 }
 """
 
@@ -568,7 +589,7 @@ class GLBRenderer:
         self.height = height
         # Runtime view toggles (flip live from a UI without rebuilding)
         self.show_facemesh = True
-        self.show_hologram = True       # holographic screen plane in front of facemesh
+        self.show_hologram = True       # screen-space holo portrait panel
         self.show_axes = DEBUG          # TNB axis/plane debug lines
         self.ghost_shaded = DEBUG       # shaded ghost rig vs depth-only occluder
         self.last_fbo = None            # raw FBO RGB (pre-mask, pre-composite)
@@ -603,21 +624,30 @@ class GLBRenderer:
         )
         self.debug_vert_count = len(dv)
 
-        # Holographic screen plane: a 2x2 triangle strip in local XY, offset
-        # +u in front of the head_bone via the bone's world matrix at render.
+        # Hologram panel: fixed NDC quad (PANEL_RECT) that samples the
+        # portrait FBO texture through the holo screen shader.
         self.holo_prog = self.ctx.program(
-            vertex_shader=HOLO_PLANE_VERT_SHADER, fragment_shader=HOLO_PLANE_FRAG_SHADER
+            vertex_shader=HOLO_SCREEN_VERT_SHADER,
+            fragment_shader=HOLO_SCREEN_FRAG_SHADER,
         )
-        ph = PLANE_HALF
-        holo_verts = np.array([
-            (-ph, -ph, PLANE_OFFSET_Z),
-            (-ph,  ph, PLANE_OFFSET_Z),
-            ( ph, -ph, PLANE_OFFSET_Z),
-            ( ph,  ph, PLANE_OFFSET_Z),
-        ], dtype="f4")
-        self.holo_vbo = self.ctx.buffer(holo_verts.tobytes())
+        l, b, r, t = PANEL_RECT
+        holo_pos = np.array([(l, b), (l, t), (r, b), (r, t)], dtype="f4")
+        holo_uv = np.array([(0, 0), (0, 1), (1, 0), (1, 1)], dtype="f4")
+        self.holo_pbo = self.ctx.buffer(holo_pos.tobytes())
+        self.holo_ubo = self.ctx.buffer(holo_uv.tobytes())
         self.holo_vao = self.ctx.vertex_array(
-            self.holo_prog, [(self.holo_vbo, "3f", "in_position")]
+            self.holo_prog,
+            [(self.holo_pbo, "2f", "in_position"),
+             (self.holo_ubo, "2f", "in_uv")],
+        )
+        self._setup_portrait_fbo()
+
+    def _setup_portrait_fbo(self):
+        # Color-only offscreen target: points are alpha-blended, no depth
+        # needed for a point cloud.
+        self.portrait_tex = self.ctx.texture((PORTRAIT_RES, PORTRAIT_RES), 4)
+        self.portrait_fbo = self.ctx.framebuffer(
+            color_attachments=[self.portrait_tex]
         )
 
     def _setup_fbo(self, w, h):
@@ -734,10 +764,10 @@ class GLBRenderer:
 
             self.meshes.append((vao, prog, faces.size))
 
-    def _make_projection(self, fov_deg=60.0):
+    def _make_projection(self, fov_deg=60.0, aspect=None):
         """Build a perspective matrix matching the webcam FOV."""
         fov = np.radians(fov_deg)
-        asp = self.width / self.height
+        asp = aspect if aspect is not None else self.width / self.height
         near, far = 0.01, 200.0
         f = 1.0 / np.tan(fov / 2)
         return np.array(
@@ -750,19 +780,17 @@ class GLBRenderer:
             dtype="f4",
         )
 
-    def set_facemesh(self, landmarks, shape):
-        """Update the facemesh vertices from MediaPipe landmarks."""
-        h, w = shape
-        # Convert from pixel space to NDC (-1 to 1)
+    def set_facemesh(self, landmarks):
+        """Update the portrait point cloud from MediaPipe landmarks.
+        Model space: image-normalized XY (y up), Z kept as MediaPipe
+        relative depth. Ponytail: lm.z is relative depth, not true
+        geometry — fine for a point cloud, wrong for solid shading."""
         points = np.array([[
-            (lm.x * w / w) * 2 - 1,  # NDC x
-            -((lm.y * h / h) * 2 - 1),  # NDC y (flip Y)
-            lm.z * 2  # scale Z for visibility
+            lm.x * 2 - 1,       # x, centered
+            -(lm.y * 2 - 1),    # y up
+            lm.z * 2,           # scaled for visible parallax
         ] for lm in landmarks], dtype='f4')
-        colors = np.full((len(points), 3), 0.0, dtype='f4')
-        colors[:, 0] = 0.8
-        colors[:, 1] = 0.9  # green
-        colors[:, 2] = 0.1
+        colors = np.ones((len(points), 3), dtype='f4')  # white; panel tints
         vbo = self.ctx.buffer(points.tobytes())
         vbo_color = self.ctx.buffer(colors.tobytes())
 
@@ -782,6 +810,28 @@ class GLBRenderer:
         face_landmarks: optional list of face landmarks for debug visualization
         Returns frame with 3D model composited on top.
         """
+        # ── Pass 0: hologram portrait (offscreen) ──────────────────────
+        # Facemesh point cloud in model space, rotated by the head pose,
+        # viewed by a fixed portrait camera. Output: portrait_tex.
+        show_portrait = (face_landmarks is not None
+                         and self.show_facemesh and self.show_hologram)
+        if show_portrait:
+            self.set_facemesh(face_landmarks)
+            self.portrait_fbo.use()
+            self.ctx.clear(0.0, 0.0, 0.0, 0.0)
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.enable(moderngl.BLEND)
+            model = (MP_TO_PORTRAIT @ head_world @ MP_TO_PORTRAIT).astype("f4")
+            model[:, 3] = (0, 0, 0, 1)  # drop head translation; portrait orbits
+            view_p = create_translation_matrix(0.0, 0.0, -PORTRAIT_CAM_DIST)
+            proj_p = self._make_projection(PORTRAIT_FOV, aspect=1.0)
+            self.point_prog["u_model"].write(model.T.tobytes())
+            self.point_prog["u_view"].write(view_p.T.tobytes())
+            self.point_prog["u_proj"].write(proj_p.T.tobytes())
+            self.point_prog["u_point_size"].value = PORTRAIT_POINT_SIZE
+            self.facemesh_vao.render(moderngl.POINTS)
+            self.ctx.disable(moderngl.BLEND)
+
         self.fbo.use()
         self.ctx.clear(0.0, 0.0, 0.0, 0.0)
         self.ctx.enable(moderngl.DEPTH_TEST)
@@ -852,41 +902,18 @@ class GLBRenderer:
             self.debug_vao.render(moderngl.LINES)
             self.ctx.enable(moderngl.DEPTH_TEST)
 
-        # ── Step 3: Render facemesh points via GL ─────────────────────
-        if face_landmarks is not None and self.show_facemesh:
-            self.set_facemesh(face_landmarks, (self.height, self.width))
-            # Points are already in NDC, use identity matrices
-            identity = np.eye(4, dtype='f4')
-            self.point_prog["u_model"].write(identity.T.tobytes())
-            self.point_prog["u_view"].write(identity.T.tobytes())
-            self.point_prog["u_proj"].write(identity.T.tobytes())
-            self.point_prog["u_point_size"].value = 3.0
-
-            # Holographic screen (POC): the visible plane is rendered in
-            # camera space — through the same view/proj as the ghost head —
-            # with an identity model (the +PLANE_OFFSET_Z is baked into the
-            # quad vertices), so it tracks the head's real 3D position.
-            # The plane geometry for the point fade is still derived from the
-            # head_bone rotation in the points' NDC frame, so the fade reacts
-            # to head orientation even though points don't share camera space.
-            holo_model = np.eye(4, dtype="f4")
-            holo_model[:3, :3] = head_world[:3, :3]
-            plane_origin = (holo_model @ np.array(
-                [0.0, 0.0, PLANE_OFFSET_Z, 1.0])).astype("f4")
-            plane_normal = (holo_model @ np.array(
-                [0.0, 0.0, 1.0, 0.0])).astype("f4")
-            self.point_prog["u_plane_point"].write(plane_origin[:3].tobytes())
-            self.point_prog["u_plane_normal"].write(plane_normal[:3].tobytes())
-            self.point_prog["u_fade_range"].value = FADE_RANGE
-
-            if self.show_hologram:
-                self.holo_prog["u_model"].write(identity.T.tobytes())
-                self.holo_prog["u_view"].write(view.T.tobytes())
-                self.holo_prog["u_proj"].write(proj.T.tobytes())
-                self.holo_prog["u_color"].value = HOLO_COLOR
-                self.holo_vao.render(moderngl.TRIANGLE_STRIP)
-
-            self.facemesh_vao.render(moderngl.POINTS)
+        # ── Pass 1: hologram panel (screen space, over the scene) ──────
+        if show_portrait:
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.enable(moderngl.BLEND)
+            self.portrait_tex.use(0)
+            self.holo_prog["u_holo_tex"].value = 0
+            self.holo_prog["u_time"].value = time.monotonic() % 100.0
+            self.holo_prog["u_tint"].value = HOLO_TINT
+            self.holo_prog["u_base_alpha"].value = PANEL_BASE_ALPHA
+            self.holo_vao.render(moderngl.TRIANGLE_STRIP)
+            self.ctx.disable(moderngl.BLEND)
+            self.ctx.enable(moderngl.DEPTH_TEST)
 
         # ── Read pixels and composite ─────────────────────────────
         raw = self.fbo.read(components=4)
@@ -994,23 +1021,44 @@ def main():
         cap.release()
 
 
-def _check_hologram_fade():
-    """Self-check: mirrors POINT_VERT_SHADER's signed-distance fade so the
-    plane math survives a refactor without running the webcam."""
+def _check_portrait_projection():
+    """Self-check: the fixed portrait camera must place the model origin at
+    panel center, keep +X mapping right, and swing the nose horizontally
+    under head yaw — so the portrait stays centered and live without the
+    webcam."""
     import numpy as _np
-    # Unit rotation (identity) head + plane at +1 on z.
-    rot = _np.eye(4)
-    plane_point = (rot @ _np.array([0.0, 0.0, PLANE_OFFSET_Z, 1.0]))[:3]
-    plane_normal = (rot @ _np.array([0.0, 0.0, 1.0, 0.0]))[:3]
-    rng = FADE_RANGE
-    fade = lambda p: _np.clip(
-        _np.dot(p[:3] - plane_point, plane_normal), 0.0, rng) / rng
-    assert fade([0.0, 0.0, 2.0]) == 1.0, "point in front should be fully lit"
-    assert fade([0.0, 0.0, 0.0]) == 0.0, "point behind plane should vanish"
-    assert 0.0 <= fade([0.0, 0.0, 1.0]) <= 1.0, "on-plane point in range"
-    print("hologram fade check: OK")
+    aspect = 1.0
+    fov = _np.radians(PORTRAIT_FOV)
+    near, far = 0.01, 200.0  # must mirror _make_projection
+    f = 1.0 / _np.tan(fov / 2)
+    proj = _np.array([
+        [f / aspect, 0, 0, 0],
+        [0, f, 0, 0],
+        [0, 0, (far + near) / (near - far), (2 * far * near) / (near - far)],
+        [0, 0, -1, 0]], dtype="f4")
+    view = create_translation_matrix(0.0, 0.0, -PORTRAIT_CAM_DIST)
+
+    def ndc(model, p):
+        # Mirror the shader: gl_Position = proj * view * model * pos, with
+        # the numpy row-vector matrices uploaded transposed (column-major).
+        clip = proj.T @ view.T @ model.T @ _np.array([*p, 1.0], dtype="f4")
+        return clip[:2] / clip[3]
+
+    ident = _np.eye(4, dtype="f4")
+    assert _np.allclose(ndc(ident, (0.0, 0.0, 0.0)), (0.0, 0.0), atol=1e-6), \
+        "model origin must project to portrait center"
+    assert ndc(ident, (0.5, 0.0, 0.0))[0] > 0, "model +X must project right"
+    assert ndc(ident, (0.0, 0.5, 0.0))[1] > 0, "model +Y must project up"
+
+    head = create_rotation_matrix(_np.radians(90), "y")
+    head[:3, 3] = (0.0, 0.0, 0.0)
+    model = MP_TO_PORTRAIT @ head @ MP_TO_PORTRAIT
+    nose = ndc(model, (0.0, 0.0, 1.0))
+    assert abs(nose[0]) > 0.2 and abs(nose[1]) < 1e-3, \
+        "head yaw must move the nose horizontally"
+    print("portrait projection check: OK")
 
 
 if __name__ == "__main__":
-    _check_hologram_fade()
+    _check_portrait_projection()
     main()
