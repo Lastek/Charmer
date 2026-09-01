@@ -170,11 +170,14 @@ GHOST_ALPHA = 0.3
 # portrait pass, raw NDC in the panel pass.
 PORTRAIT_RES = 384                          # square offscreen FBO size
 PANEL_RECT = (0.35, -0.95, 0.95, 0.35)      # NDC: left, bottom, right, top
-PORTRAIT_CAM_DIST = 3.5                     # portrait camera distance
-PORTRAIT_FOV = 60.0
+PORTRAIT_CAM_DIST = 1.0                     # portrait camera distance
+PORTRAIT_FOV = 74.0
+PORTRAIT_FIT = 0.8                          # extra margin: face <= 80% of view
+PORTRAIT_DEPTH = 0.6                        # face depth (z span) as a fraction
 HOLO_TINT = (0.30, 0.80, 1.00)
-PANEL_BASE_ALPHA = 0.08
-PORTRAIT_POINT_SIZE = 4.0
+PANEL_BASE_ALPHA = 0.15
+PORTRAIT_POINT_SIZE = 5.0
+OVERLAY_POINT_SIZE = 3.0
 
 # MP -> portrait basis change (y down/z in -> y up/z out). Ponytail:
 # chirality verified by eye, not derived from a spec; if the portrait
@@ -600,11 +603,16 @@ class GLBRenderer:
         # self._load_ghost_head(head_path)
         self._load_ghost_head('blank.glb')
         self._setup_point_shader()
-        self.facemesh_vbo = None
-        self.facemesh_vao = None
+        self.face_overlay_vao = None
+        self.face_portrait_vao = None
         self.facemesh_count = 0
+        self.neutral_rot = None     # first-frame head rotation (front reference)
 
     def _setup_point_shader(self):
+        # Required in core profile: without this the vertex shader's
+        # gl_PointSize is ignored and points clip to 1px (invisible once
+        # down-sampled through the portrait FBO).
+        self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
         self.point_prog = self.ctx.program(
             vertex_shader=POINT_VERT_SHADER, fragment_shader=POINT_FRAG_SHADER
         )
@@ -781,27 +789,53 @@ class GLBRenderer:
         )
 
     def set_facemesh(self, landmarks):
-        """Update the portrait point cloud from MediaPipe landmarks.
-        Model space: image-normalized XY (y up), Z kept as MediaPipe
-        relative depth. Ponytail: lm.z is relative depth, not true
-        geometry — fine for a point cloud, wrong for solid shading."""
-        points = np.array([[
-            lm.x * 2 - 1,       # x, centered
-            -(lm.y * 2 - 1),    # y up
-            lm.z * 2,           # scaled for visible parallax
-        ] for lm in landmarks], dtype='f4')
-        colors = np.ones((len(points), 3), dtype='f4')  # white; panel tints
-        vbo = self.ctx.buffer(points.tobytes())
-        vbo_color = self.ctx.buffer(colors.tobytes())
+        """Build two point-cloud VAOs from MediaPipe landmarks.
 
-        self.facemesh_vao = self.ctx.vertex_array(
+        overlay  — full-image NDC (y up): drawn over the face in the
+                   camera view with identity view/proj, so the dots sit
+                   exactly on the tracked face.
+        portrait — face-normalized model: centered and scaled so the face
+                   fills [-1,1], y up, Z kept as relative depth. Drawn into
+                   the offscreen portrait with the head-relative rotation.
+        Ponytail: lm.z is relative depth, not true geometry — fine for a
+        point cloud, wrong for solid shading."""
+        pts = np.array([[lm.x, lm.y, lm.z] for lm in landmarks], dtype='f4')
+
+        overlay = pts.copy()
+        overlay[:, 0] = overlay[:, 0] * 2 - 1
+        overlay[:, 1] = -(overlay[:, 1] * 2 - 1)
+        overlay[:, 2] = overlay[:, 2] * 2
+
+        cx = (overlay[:, 0].min() + overlay[:, 0].max()) / 2.0
+        cy = (overlay[:, 1].min() + overlay[:, 1].max()) / 2.0
+        ext = max(overlay[:, 0].max() - overlay[:, 0].min(),
+                  overlay[:, 1].max() - overlay[:, 1].min())
+        ext = ext if ext > 1e-6 else 1.0
+
+        portrait = overlay.copy()
+        portrait[:, 0] = (portrait[:, 0] - cx) / ext
+        portrait[:, 1] = (portrait[:, 1] - cy) / ext
+        # depth: MediaPipe lm.z is not in the same units as x/y, so scale it
+        # into a fixed fraction of the face width, centered on the face and
+        # negated so the nose points toward the portrait camera (-z = near).
+        zraw = overlay[:, 2] - overlay[:, 2].mean()
+        zamp = max(abs(zraw.min()), abs(zraw.max()), 1e-6)
+        portrait[:, 2] = -zraw / zamp * PORTRAIT_DEPTH
+        portrait *= PORTRAIT_FIT
+        self.portrait_points = portrait
+
+        colors = np.ones((len(pts), 3), dtype='f4')  # white; panel tints
+        self.face_overlay_vao = self._make_point_vao(overlay, colors)
+        self.face_portrait_vao = self._make_point_vao(portrait, colors)
+        self.facemesh_count = len(pts)
+
+    def _make_point_vao(self, points, colors):
+        vbo = self.ctx.buffer(points.astype("f4").tobytes())
+        vbo_color = self.ctx.buffer(colors.astype("f4").tobytes())
+        return self.ctx.vertex_array(
             self.point_prog,
-            [
-                (vbo, "3f", "in_position"),
-                (vbo_color, "3f", "in_color"),
-            ],
+            [(vbo, "3f", "in_position"), (vbo_color, "3f", "in_color")],
         )
-        self.facemesh_count = len(points)
 
     def render(self, frame, head_world, head_mask=None, face_landmarks=None):
         """
@@ -821,16 +855,34 @@ class GLBRenderer:
             self.ctx.clear(0.0, 0.0, 0.0, 0.0)
             self.ctx.disable(moderngl.DEPTH_TEST)
             self.ctx.enable(moderngl.BLEND)
-            model = (MP_TO_PORTRAIT @ head_world @ MP_TO_PORTRAIT).astype("f4")
-            model[:, 3] = (0, 0, 0, 1)  # drop head translation; portrait orbits
-            view_p = create_translation_matrix(0.0, 0.0, -PORTRAIT_CAM_DIST)
+            # Relative head rotation from the first frame as "forward", so
+            # the portrait starts front-facing and only the delta turns it.
+            # The MP->portrait basis change (y/z flip) is applied last.
+            head_rot = head_world[:3, :3].astype("f4")
+            if self.neutral_rot is None:
+                self.neutral_rot = head_rot
+            delta = head_rot @ self.neutral_rot.T
+            f3 = MP_TO_PORTRAIT[:3, :3]
+            model = np.eye(4, dtype="f4")
+            model[:3, :3] = f3 @ delta @ f3
+            # create_translation_matrix writes a row-vector matrix (translation in
+            # the last row); transpose it into the column-vector convention
+            # used everywhere else (translation in the last column), or the
+            # camera offset lands in W and distance only changes clipping.
+            view_p = create_translation_matrix(0.0, 0.0, -PORTRAIT_CAM_DIST).T
             proj_p = self._make_projection(PORTRAIT_FOV, aspect=1.0)
             self.point_prog["u_model"].write(model.T.tobytes())
             self.point_prog["u_view"].write(view_p.T.tobytes())
             self.point_prog["u_proj"].write(proj_p.T.tobytes())
             self.point_prog["u_point_size"].value = PORTRAIT_POINT_SIZE
-            self.facemesh_vao.render(moderngl.POINTS)
+            self.face_portrait_vao.render(moderngl.POINTS)
             self.ctx.disable(moderngl.BLEND)
+            if DEBUG:
+                raw_p = self.portrait_fbo.read(components=3)
+                self.last_portrait = np.frombuffer(
+                    raw_p, dtype=np.uint8).reshape(
+                        PORTRAIT_RES, PORTRAIT_RES, 3)
+                self.last_portrait = np.flipud(self.last_portrait.copy())
 
         self.fbo.use()
         self.ctx.clear(0.0, 0.0, 0.0, 0.0)
@@ -900,6 +952,22 @@ class GLBRenderer:
             self.debug_prog["u_view"].write(view.T.tobytes())
             self.debug_prog["u_proj"].write(proj.T.tobytes())
             self.debug_vao.render(moderngl.LINES)
+
+        # ── Overlay facemesh points on the face (screen space) ──────
+        # NDC points drawn with identity view/proj so they sit exactly on
+        # the tracked face; depth off so nothing occludes them.
+        if face_landmarks is not None and self.show_facemesh:
+            self.ctx.disable(moderngl.DEPTH_TEST)
+            self.ctx.enable(moderngl.BLEND)
+            identity = np.eye(4, dtype="f4")
+            self.point_prog["u_model"].write(identity.T.tobytes())
+            self.point_prog["u_view"].write(identity.T.tobytes())
+            self.point_prog["u_proj"].write(identity.T.tobytes())
+            self.point_prog["u_point_size"].value = OVERLAY_POINT_SIZE
+            self.face_overlay_vao.render(moderngl.POINTS)
+            self.ctx.disable(moderngl.BLEND)
+            self.ctx.enable(moderngl.DEPTH_TEST)
+        elif self.show_axes:
             self.ctx.enable(moderngl.DEPTH_TEST)
 
         # ── Pass 1: hologram panel (screen space, over the scene) ──────
@@ -1012,6 +1080,8 @@ def main():
                         combined = np.hstack([original_small, denoised_debug])
                         cv2.imshow("Denoise Debug", combined)
                         cv2.imshow("FBO", fbo_debug)
+                        if getattr(renderer, "last_portrait", None) is not None:
+                            cv2.imshow("Portrait FBO", renderer.last_portrait)
 
                 cv2.imshow("AR 3D Model", frame)
                 if cv2.waitKey(5) & 0xFF == ord("q"):
@@ -1036,12 +1106,13 @@ def _check_portrait_projection():
         [0, f, 0, 0],
         [0, 0, (far + near) / (near - far), (2 * far * near) / (near - far)],
         [0, 0, -1, 0]], dtype="f4")
-    view = create_translation_matrix(0.0, 0.0, -PORTRAIT_CAM_DIST)
+    view = create_translation_matrix(0.0, 0.0, -PORTRAIT_CAM_DIST).T
 
     def ndc(model, p):
-        # Mirror the shader: gl_Position = proj * view * model * pos, with
-        # the numpy row-vector matrices uploaded transposed (column-major).
-        clip = proj.T @ view.T @ model.T @ _np.array([*p, 1.0], dtype="f4")
+        # Mirror the shader: gl_Position = proj * view * model * pos. The
+        # matrices are the numpy column-vector matrices as-written (the
+        # ".T" at upload only fixes byte order, introducing no transpose).
+        clip = proj @ view @ model @ _np.array([*p, 1.0], dtype="f4")
         return clip[:2] / clip[3]
 
     ident = _np.eye(4, dtype="f4")
