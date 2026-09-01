@@ -76,6 +76,18 @@ def create_translation_matrix(x, y, z):
     return np.array([[1,0,0,0], [0,1,0,0], [0,0,1,0], [x,y,z,1]], dtype='f4')
 
 
+def make_neck_pivot_model(rotation, neck_y, neck_z):
+    """Rotate about a point 'neck' below/behind the face center:
+    T(neck) @ R @ T(-neck). The face stays centered at rest, but yaw/pitch
+    now pivot about the neck (column-vector convention, like the bone rig)."""
+    R4 = np.eye(4, dtype="f4")
+    R4[:3, :3] = rotation
+    n = np.array([0.0, -neck_y, neck_z], dtype="f4")
+    Tp = create_translation_matrix(n[0], n[1], n[2]).T
+    Tn = create_translation_matrix(-n[0], -n[1], -n[2]).T
+    return Tp @ R4 @ Tn
+
+
 # ── Skeleton (bone tree) ──────────────────────────────────────────
 class Bone:
     """Minimal bone: local 4x4 transform parented to another bone.
@@ -172,7 +184,7 @@ PORTRAIT_RES = 384                          # offscreen FBO height (px)
 PANEL_RECT = (0.35, -0.95, 0.95, 0.35)      # NDC: left, bottom, right, top
 PORTRAIT_CAM_DIST = 3.0                     # portrait camera distance
 PORTRAIT_FOV = 60.0
-PORTRAIT_FIT = 0.7                          # extra margin around x/y only
+PORTRAIT_FIT = 2.3                          # extra margin around x/y only
 PORTRAIT_DEPTH = 0.5                        # face depth (z span) relative to size
 # Per-axis head-rotation gain. Yaw (turn left/right) barely moves the nose
 # (it sits near the centroid), while pitch (nod) swings the chin/forehead
@@ -180,6 +192,14 @@ PORTRAIT_DEPTH = 0.5                        # face depth (z span) relative to si
 PORTRAIT_YAW_GAIN = 2.0
 PORTRAIT_PITCH_GAIN = 0.5
 PORTRAIT_ROLL_GAIN = 1.0
+# Neck pivot: the face center sits this far above (y) and forward (z) of the
+# neck. Rotation pivots about the neck, so yaw swings the head instead of
+# foreshortening the face in place. Normalized portrait units (face ~1).
+PORTRAIT_NECK_Y = 0.55
+PORTRAIT_NECK_Z = 0.20
+# Same pivot in the metric AR rig (face ~10 units); placeholder until real
+# hat/ghost GLBs are loaded, so it only affects the (currently blank) GLBs.
+NECK_TO_FACE_METRIC = (0.0, 1.5, -3.0)
 HOLO_TINT = (0.30, 0.80, 1.00)
 PANEL_BASE_ALPHA = 0.15
 PORTRAIT_POINT_SIZE = 5.0
@@ -512,6 +532,10 @@ void main() {
 
 POINT_FRAG_SHADER = """
 #version 330
+uniform vec3 u_tint;
+uniform float u_time;
+uniform float u_holo;   // 1.0 = holographic styling, 0.0 = flat 2D overlay
+
 in vec3 v_color;
 out vec4 fragColor;
 
@@ -519,7 +543,13 @@ void main() {
     // round, soft-edged point sprite
     float d = length(gl_PointCoord - 0.5) * 2.0;
     float a = smoothstep(1.0, 0.5, d);
-    fragColor = vec4(v_color, a);
+    vec3 col = v_color;
+    if (u_holo > 0.5) {
+        float scan    = 0.85 + 0.15 * sin(gl_FragCoord.y * 0.8 - u_time * 6.0);
+        float flicker = 0.92 + 0.08 * sin(u_time * 47.0) * sin(u_time * 13.7);
+        col = v_color * u_tint * scan * flicker;
+    }
+    fragColor = vec4(col, a);
 }
 """
 
@@ -538,7 +568,6 @@ void main() {
 HOLO_SCREEN_FRAG_SHADER = """
 #version 330
 uniform sampler2D u_holo_tex;
-uniform float u_time;
 uniform vec3 u_tint;
 uniform float u_base_alpha;
 
@@ -546,21 +575,17 @@ in vec2 v_uv;
 out vec4 fragColor;
 
 void main() {
+    // The portrait texture already carries the holographic styling
+    // (tint/scanlines/flicker); here we only add the panel frame.
     vec4 content = texture(u_holo_tex, v_uv);
-    float lum = dot(content.rgb, vec3(0.299, 0.587, 0.114));
-
-    float scan    = 0.85 + 0.15 * sin(v_uv.y * 300.0 - u_time * 6.0);
-    float flicker = 0.92 + 0.08 * sin(u_time * 47.0) * sin(u_time * 13.7);
 
     vec2  to_edge = min(v_uv, 1.0 - v_uv);
     float edge    = min(to_edge.x, to_edge.y);
     float border  = smoothstep(0.015, 0.0, edge);   // hard rim line
     float glow    = smoothstep(0.10, 0.0, edge);    // soft inner falloff
 
-    vec3 col = u_tint * lum * scan * flicker
-             + u_tint * (border * 0.9 + glow * 0.20);
-    float alpha = clamp(lum * content.a * scan
-                        + u_base_alpha * glow + border * 0.6, 0.0, 1.0);
+    vec3 col = content.rgb + u_tint * (border * 0.9 + glow * 0.20);
+    float alpha = clamp(content.a + u_base_alpha * glow + border * 0.6, 0.0, 1.0);
     fragColor = vec4(col, alpha);
 }
 """
@@ -887,16 +912,18 @@ class GLBRenderer:
                 self.neutral_rot = head_rot
             delta = head_rot @ self.neutral_rot.T
             f3 = MP_TO_PORTRAIT[:3, :3]
-            model = np.eye(4, dtype="f4")
-            model[:3, :3] = f3 @ delta @ f3
+            R = (f3 @ delta @ f3).astype("f4")
             # Rebalance the rotation per axis: yaw reads too weak and pitch
             # too strong on a near-flat face cloud. Decompose -> scale ->
             # recompose (small angles, euler is branch-stable here).
-            e = Rotation.from_matrix(model[:3, :3]).as_euler("xyz")
+            e = Rotation.from_matrix(R).as_euler("xyz")
             e[0] *= PORTRAIT_PITCH_GAIN
             e[1] *= PORTRAIT_YAW_GAIN
             e[2] *= PORTRAIT_ROLL_GAIN
-            model[:3, :3] = Rotation.from_euler("xyz", e).as_matrix().astype("f4")
+            R = Rotation.from_euler("xyz", e).as_matrix().astype("f4")
+            # Pivot the rotation about the neck (see make_neck_pivot_model),
+            # not the nose bridge.
+            model = make_neck_pivot_model(R, PORTRAIT_NECK_Y, PORTRAIT_NECK_Z)
             # create_translation_matrix writes a row-vector matrix (translation in
             # the last row); transpose it into the column-vector convention
             # used everywhere else (translation in the last column), or the
@@ -907,6 +934,9 @@ class GLBRenderer:
             self.point_prog["u_view"].write(view_p.T.tobytes())
             self.point_prog["u_proj"].write(proj_p.T.tobytes())
             self.point_prog["u_point_size"].value = PORTRAIT_POINT_SIZE
+            self.point_prog["u_tint"].value = HOLO_TINT
+            self.point_prog["u_time"].value = time.monotonic() % 100.0
+            self.point_prog["u_holo"].value = 1.0
             self.face_portrait_vao.render(moderngl.POINTS)
             self.ctx.disable(moderngl.BLEND)
             if DEBUG:
@@ -996,6 +1026,7 @@ class GLBRenderer:
             self.point_prog["u_view"].write(identity.T.tobytes())
             self.point_prog["u_proj"].write(identity.T.tobytes())
             self.point_prog["u_point_size"].value = OVERLAY_POINT_SIZE
+            self.point_prog["u_holo"].value = 0.0
             self.face_overlay_vao.render(moderngl.POINTS)
             self.ctx.disable(moderngl.BLEND)
             self.ctx.enable(moderngl.DEPTH_TEST)
@@ -1008,7 +1039,6 @@ class GLBRenderer:
             self.ctx.enable(moderngl.BLEND)
             self.portrait_tex.use(0)
             self.holo_prog["u_holo_tex"].value = 0
-            self.holo_prog["u_time"].value = time.monotonic() % 100.0
             self.holo_prog["u_tint"].value = HOLO_TINT
             self.holo_prog["u_base_alpha"].value = PANEL_BASE_ALPHA
             self.holo_vao.render(moderngl.TRIANGLE_STRIP)
@@ -1067,7 +1097,7 @@ def main():
     renderer = GLBRenderer(GLB_PATH, HEAD_PATH, w, h)
     stabilizer = MatrixStabilizer()
     segmenter = HeadSegmenter(SEGMENTATION_MODEL)
-    _, _, head_bone = build_skeleton()
+    root, neck, head_bone = build_skeleton()
 
     base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
     options = vision.FaceLandmarkerOptions(
@@ -1095,7 +1125,14 @@ def main():
                 if LANDMARKER_RESULT and LANDMARKER_RESULT.facial_transformation_matrixes:
                     results = LANDMARKER_RESULT
                     face_matrix = np.array(results.facial_transformation_matrixes[0]).reshape(4, 4)
-                    head_bone.local = stabilizer.stabilize(face_matrix, timestamp_ms, LANDMARKER_RESULT_TS)
+                    smoothed = stabilizer.stabilize(face_matrix, timestamp_ms, LANDMARKER_RESULT_TS)
+                    # Realize the rig: the neck is the pivot (holds the pose
+                    # rotation + position), the head carries only the fixed
+                    # neck->face offset. head_bone.world() still reconstructs
+                    # `smoothed`, so the AR attach is unchanged.
+                    mx, my, mz = NECK_TO_FACE_METRIC
+                    head_bone.local = create_translation_matrix(mx, my, mz).T
+                    neck.local = smoothed @ create_translation_matrix(-mx, -my, -mz).T
                     # Get segmentation mask
                     # head_mask = segmenter.get_head_mask(frame)
                     head_mask = None

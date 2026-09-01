@@ -1,7 +1,7 @@
 """Self-check for the mshow3 bone rig. Run: python test_rig.py (conda env: media)"""
 import numpy as np
 from mshow3 import build_skeleton, HAT_LOCAL, GHOST_LOCAL, bone_tree_debug, \
-    build_axis_frame_lines, MatrixStabilizer
+    build_axis_frame_lines, MatrixStabilizer, make_neck_pivot_model
 from scipy.spatial.transform import Rotation
 
 # 1. Hierarchy structure
@@ -114,6 +114,20 @@ for i in range(58):
     prev_rv = rv
 max_step = max(rv_steps)
 assert max_step < 8.0, f"rotation blew through: {max_step:.2f} deg/frame"
+
+# 13. Neck pivot: identity at rest, and yaw swings a nose point sideways
+#     (rotation pivots about the neck, not the face center).
+def _rot_y(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype="f4")
+
+rest = make_neck_pivot_model(np.eye(3, dtype="f4"), 0.55, 0.2)
+assert np.allclose(rest, np.eye(4, dtype="f4"), atol=1e-6), \
+    "neck pivot must be identity at rest"
+yaw = make_neck_pivot_model(_rot_y(np.radians(60)), 0.55, 0.2)
+nose = np.array([0.0, 0.0, -0.3, 1.0], dtype="f4")
+world = yaw @ nose
+assert abs(world[0]) > 0.1, f"nose did not swing under yaw: x={world[0]:.3f}"
 
 print("rig self-check OK")
 

@@ -90,7 +90,7 @@ def pipeline_worker(state):
         stabilizer = MatrixStabilizer()
         segmenter = HeadSegmenter(SEGMENTATION_MODEL)
         denoiser = None
-        _, _, head_bone = build_skeleton()
+        root, neck, head_bone = build_skeleton()
 
         base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
         options = vision.FaceLandmarkerOptions(
@@ -133,8 +133,12 @@ def pipeline_worker(state):
                 if result and result.facial_transformation_matrixes:
                     face_matrix = np.array(
                         result.facial_transformation_matrixes[0]).reshape(4, 4)
-                    head_bone.local = stabilizer.stabilize(
+                    smoothed = stabilizer.stabilize(
                         face_matrix, timestamp_ms, ms.LANDMARKER_RESULT_TS)
+                    mx, my, mz = ms.NECK_TO_FACE_METRIC
+                    head_bone.local = ms.create_translation_matrix(mx, my, mz).T
+                    neck.local = smoothed @ ms.create_translation_matrix(
+                        -mx, -my, -mz).T
                     ar = renderer.render(
                         source, head_bone.world(), head_mask,
                         result.face_landmarks[0],

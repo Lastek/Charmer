@@ -4,3 +4,4 @@
 IRCapture/bin
 IRCapture/obj
 UAP/lib
+*.pyc
