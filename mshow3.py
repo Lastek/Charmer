@@ -172,12 +172,12 @@ PORTRAIT_RES = 384                          # offscreen FBO height (px)
 PANEL_RECT = (0.35, -0.95, 0.95, 0.35)      # NDC: left, bottom, right, top
 PORTRAIT_CAM_DIST = 3.0                     # portrait camera distance
 PORTRAIT_FOV = 60.0
-PORTRAIT_FIT = 0.7                          # extra margin: face <= 80% of view
-PORTRAIT_DEPTH = 0.3                        # face depth (z span) as a fraction
+PORTRAIT_FIT = 0.7                          # extra margin around x/y only
+PORTRAIT_DEPTH = 0.5                        # face depth (z span) relative to size
 # Per-axis head-rotation gain. Yaw (turn left/right) barely moves the nose
 # (it sits near the centroid), while pitch (nod) swings the chin/forehead
 # through a lot of depth; tune these independently to balance the feel.
-PORTRAIT_YAW_GAIN = 1.5
+PORTRAIT_YAW_GAIN = 2.0
 PORTRAIT_PITCH_GAIN = 0.5
 PORTRAIT_ROLL_GAIN = 1.0
 HOLO_TINT = (0.30, 0.80, 1.00)
@@ -841,8 +841,12 @@ class GLBRenderer:
         zraw = overlay[:, 2] - overlay[:, 2].mean()
         zamp = max(abs(zraw.min()), abs(zraw.max()), 1e-6)
         portrait[:, 2] = -zraw / zamp * PORTRAIT_DEPTH
-        portrait *= PORTRAIT_FIT
+        # Keep depth full-strength; only inset x/y (FIT). Shrinking z too
+        # makes yaw read as pure horizontal foreshortening.
+        portrait[:, 0] *= PORTRAIT_FIT
+        portrait[:, 1] *= PORTRAIT_FIT
         self.portrait_points = portrait
+        self.z_raw_span = (float(pts[:, 2].min()), float(pts[:, 2].max()))
 
         colors = np.ones((len(pts), 3), dtype='f4')  # white; panel tints
         self.face_overlay_vao = self._make_point_vao(overlay, colors)
@@ -1101,6 +1105,10 @@ def main():
                     frame_count += 1
                     if DEBUG and frame_count % 30 == 0:
                         print(bone_tree_debug(head_bone))
+                        zr = getattr(renderer, "z_raw_span", None)
+                        if zr is not None:
+                            print(f"lm.z raw span: min={zr[0]:+.4f} "
+                                  f"max={zr[1]:+.4f} (range={zr[1]-zr[0]:.4f})")
 
                     if DEBUG:
                         original_small = cv2.resize(original, (320, 240))
