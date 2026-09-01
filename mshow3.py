@@ -189,19 +189,20 @@ PORTRAIT_DEPTH = 0.5                        # face depth (z span) relative to si
 # Per-axis head-rotation gain. Yaw (turn left/right) barely moves the nose
 # (it sits near the centroid), while pitch (nod) swings the chin/forehead
 # through a lot of depth; tune these independently to balance the feel.
-PORTRAIT_YAW_GAIN = 2.0
+PORTRAIT_YAW_GAIN = 5.0
 PORTRAIT_PITCH_GAIN = 0.5
 PORTRAIT_ROLL_GAIN = 1.0
 # Neck pivot: the face center sits this far above (y) and forward (z) of the
 # neck. Rotation pivots about the neck, so yaw swings the head instead of
 # foreshortening the face in place. Normalized portrait units (face ~1).
 PORTRAIT_NECK_Y = 0.55
-PORTRAIT_NECK_Z = 0.20
+PORTRAIT_NECK_Z = 0 # 0.20
 # Same pivot in the metric AR rig (face ~10 units); placeholder until real
 # hat/ghost GLBs are loaded, so it only affects the (currently blank) GLBs.
 NECK_TO_FACE_METRIC = (0.0, 1.5, -3.0)
 HOLO_TINT = (0.30, 0.80, 1.00)
 PANEL_BASE_ALPHA = 0.15
+GLOW_STRENGTH = 0.55                     # bloom add-back strength (0 = off)
 PORTRAIT_POINT_SIZE = 5.0
 OVERLAY_POINT_SIZE = 3.0
 
@@ -615,6 +616,56 @@ void main() {
 }
 """
 
+POST_VERT_SHADER = """
+#version 330
+in vec2 in_position;   // fullscreen NDC quad (-1..1)
+out vec2 v_uv;
+
+void main() {
+    v_uv = in_position * 0.5 + 0.5;
+    gl_Position = vec4(in_position, 0.0, 1.0);
+}
+"""
+
+BLUR_FRAG_SHADER = """
+#version 330
+uniform sampler2D u_tex;
+uniform vec2 u_dir;   // (1,0) horizontal, (0,1) vertical
+uniform vec2 u_res;   // texture size in pixels
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+    vec2 step = u_dir / u_res;
+    vec3 acc = texture(u_tex, v_uv).rgb * 0.227027;
+    acc += texture(u_tex, v_uv + step).rgb * 0.1945946;
+    acc += texture(u_tex, v_uv - step).rgb * 0.1945946;
+    acc += texture(u_tex, v_uv + step * 2.0).rgb * 0.1216216;
+    acc += texture(u_tex, v_uv - step * 2.0).rgb * 0.1216216;
+    acc += texture(u_tex, v_uv + step * 3.0).rgb * 0.054054;
+    acc += texture(u_tex, v_uv - step * 3.0).rgb * 0.054054;
+    acc += texture(u_tex, v_uv + step * 4.0).rgb * 0.016216;
+    acc += texture(u_tex, v_uv - step * 4.0).rgb * 0.016216;
+    fragColor = vec4(acc, 1.0);
+}
+"""
+
+BLOOM_ADD_FRAG_SHADER = """
+#version 330
+uniform sampler2D u_tex;
+uniform float u_strength;
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+    vec3 c = texture(u_tex, v_uv).rgb * u_strength;
+    float l = dot(c, vec3(0.299, 0.587, 0.114));
+    fragColor = vec4(c, l);
+}
+"""
+
 
 class GLBRenderer:
     def __init__(self, glb_path, head_path, width, height):
@@ -627,6 +678,7 @@ class GLBRenderer:
         self.show_hologram = True       # screen-space holo portrait panel
         self.show_axes = DEBUG          # TNB axis/plane debug lines
         self.ghost_shaded = DEBUG       # shaded ghost rig vs depth-only occluder
+        self.glow = True                 # bloom/glow post-process on the portrait
         self.last_fbo = None            # raw FBO RGB (pre-mask, pre-composite)
         self.meshes = []  # list of (vao, prog, index_count)
         self._setup_fbo(width, height)
@@ -681,6 +733,59 @@ class GLBRenderer:
              (self.holo_ubo, "2f", "in_uv")],
         )
         self._setup_portrait_fbo()
+        self._setup_bloom()
+
+    def _setup_bloom(self):
+        # Post-process program + fullscreen quad for the glow/bloom passes.
+        self.post_blur_prog = self.ctx.program(
+            vertex_shader=POST_VERT_SHADER, fragment_shader=BLUR_FRAG_SHADER
+        )
+        self.post_add_prog = self.ctx.program(
+            vertex_shader=POST_VERT_SHADER, fragment_shader=BLOOM_ADD_FRAG_SHADER
+        )
+        quad = np.array([(-1, -1), (-1, 1), (1, -1), (1, 1)], dtype="f4")
+        self.post_vbo = self.ctx.buffer(quad.tobytes())
+        self.post_blur_vao = self.ctx.vertex_array(
+            self.post_blur_prog, [(self.post_vbo, "2f", "in_position")]
+        )
+        self.post_add_vao = self.ctx.vertex_array(
+            self.post_add_prog, [(self.post_vbo, "2f", "in_position")]
+        )
+
+    def _render_bloom(self):
+        """Two-pass separable gaussian blur of the portrait, added back
+        additively for a soft glow. Reads portrait_tex, writes through two
+        scratch FBOs, lands on portrait_fbo."""
+        pw, ph = self.portrait_size
+        u_res = (pw, ph)
+        p = self.post_blur_prog
+        p["u_res"].value = u_res
+
+        # horizontal blur: portrait -> blur_tmp
+        self.blur_tmp_fbo.use()
+        self.portrait_tex.use(0)
+        p["u_tex"].value = 0
+        p["u_dir"].value = (1.0, 0.0)
+        self.post_blur_vao.render(moderngl.TRIANGLE_STRIP)
+
+        # vertical blur: blur_tmp -> bloom
+        self.bloom_fbo.use()
+        self.blur_tmp_tex.use(0)
+        p["u_tex"].value = 0
+        p["u_dir"].value = (0.0, 1.0)
+        self.post_blur_vao.render(moderngl.TRIANGLE_STRIP)
+
+        # additive combine back onto the portrait
+        self.portrait_fbo.use()
+        self.ctx.enable(moderngl.BLEND)
+        self.ctx.blend_func = (moderngl.ONE, moderngl.ONE)
+        self.bloom_tex.use(0)
+        a = self.post_add_prog
+        a["u_tex"].value = 0
+        a["u_strength"].value = GLOW_STRENGTH
+        self.post_add_vao.render(moderngl.TRIANGLE_STRIP)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+        self.ctx.disable(moderngl.BLEND)
 
     def _setup_portrait_fbo(self):
         # Size the offscreen target to the panel's pixel aspect so the
@@ -696,6 +801,15 @@ class GLBRenderer:
         self.portrait_tex = self.ctx.texture(self.portrait_size, 4)
         self.portrait_fbo = self.ctx.framebuffer(
             color_attachments=[self.portrait_tex]
+        )
+        # Bloom intermediates (same size): horizontal blur -> vertical blur.
+        self.blur_tmp_tex = self.ctx.texture(self.portrait_size, 4)
+        self.blur_tmp_fbo = self.ctx.framebuffer(
+            color_attachments=[self.blur_tmp_tex]
+        )
+        self.bloom_tex = self.ctx.texture(self.portrait_size, 4)
+        self.bloom_fbo = self.ctx.framebuffer(
+            color_attachments=[self.bloom_tex]
         )
 
     def _setup_fbo(self, w, h):
@@ -939,6 +1053,8 @@ class GLBRenderer:
             self.point_prog["u_holo"].value = 1.0
             self.face_portrait_vao.render(moderngl.POINTS)
             self.ctx.disable(moderngl.BLEND)
+            if self.glow:
+                self._render_bloom()
             if DEBUG:
                 raw_p = self.portrait_fbo.read(components=3)
                 pw, ph = self.portrait_size
