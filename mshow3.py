@@ -168,12 +168,18 @@ GHOST_ALPHA = 0.3
 # on a fixed screen-space panel quad with holo styling (scanlines, rim
 # glow, flicker). Two spaces, never mixed: 3D model space inside the
 # portrait pass, raw NDC in the panel pass.
-PORTRAIT_RES = 384                          # square offscreen FBO size
+PORTRAIT_RES = 384                          # offscreen FBO height (px)
 PANEL_RECT = (0.35, -0.95, 0.95, 0.35)      # NDC: left, bottom, right, top
-PORTRAIT_CAM_DIST = 1.0                     # portrait camera distance
-PORTRAIT_FOV = 74.0
-PORTRAIT_FIT = 0.8                          # extra margin: face <= 80% of view
-PORTRAIT_DEPTH = 0.6                        # face depth (z span) as a fraction
+PORTRAIT_CAM_DIST = 3.0                     # portrait camera distance
+PORTRAIT_FOV = 60.0
+PORTRAIT_FIT = 0.7                          # extra margin: face <= 80% of view
+PORTRAIT_DEPTH = 0.3                        # face depth (z span) as a fraction
+# Per-axis head-rotation gain. Yaw (turn left/right) barely moves the nose
+# (it sits near the centroid), while pitch (nod) swings the chin/forehead
+# through a lot of depth; tune these independently to balance the feel.
+PORTRAIT_YAW_GAIN = 1.5
+PORTRAIT_PITCH_GAIN = 0.5
+PORTRAIT_ROLL_GAIN = 1.0
 HOLO_TINT = (0.30, 0.80, 1.00)
 PANEL_BASE_ALPHA = 0.15
 PORTRAIT_POINT_SIZE = 5.0
@@ -590,6 +596,7 @@ class GLBRenderer:
         self.ctx = moderngl.create_standalone_context()
         self.width = width
         self.height = height
+        self.aspect = width / height     # frame aspect (w/h)
         # Runtime view toggles (flip live from a UI without rebuilding)
         self.show_facemesh = True
         self.show_hologram = True       # screen-space holo portrait panel
@@ -651,9 +658,17 @@ class GLBRenderer:
         self._setup_portrait_fbo()
 
     def _setup_portrait_fbo(self):
-        # Color-only offscreen target: points are alpha-blended, no depth
-        # needed for a point cloud.
-        self.portrait_tex = self.ctx.texture((PORTRAIT_RES, PORTRAIT_RES), 4)
+        # Size the offscreen target to the panel's pixel aspect so the
+        # content is never squashed horizontally/vertically when the
+        # portrait texture is stretched onto the panel quad. Color-only:
+        # points are alpha-blended, no depth needed.
+        ndc_w = PANEL_RECT[2] - PANEL_RECT[0]
+        ndc_h = PANEL_RECT[3] - PANEL_RECT[1]
+        self.portrait_aspect = (ndc_w / ndc_h) * self.aspect
+        ph = PORTRAIT_RES
+        pw = max(int(round(ph * self.portrait_aspect)), 1)
+        self.portrait_size = (pw, ph)
+        self.portrait_tex = self.ctx.texture(self.portrait_size, 4)
         self.portrait_fbo = self.ctx.framebuffer(
             color_attachments=[self.portrait_tex]
         )
@@ -806,15 +821,20 @@ class GLBRenderer:
         overlay[:, 1] = -(overlay[:, 1] * 2 - 1)
         overlay[:, 2] = overlay[:, 2] * 2
 
-        cx = (overlay[:, 0].min() + overlay[:, 0].max()) / 2.0
-        cy = (overlay[:, 1].min() + overlay[:, 1].max()) / 2.0
-        ext = max(overlay[:, 0].max() - overlay[:, 0].min(),
-                  overlay[:, 1].max() - overlay[:, 1].min())
+        # Isotropic model units: MediaPipe normalizes x by width and y by
+        # height, so y must be divided by the frame aspect to reach the same
+        # units as x — otherwise the face is squashed from the sides.
+        iso_x = overlay[:, 0]
+        iso_y = overlay[:, 1] / self.aspect
+
+        cx = (iso_x.min() + iso_x.max()) / 2.0
+        cy = (iso_y.min() + iso_y.max()) / 2.0
+        ext = max(iso_x.max() - iso_x.min(), iso_y.max() - iso_y.min())
         ext = ext if ext > 1e-6 else 1.0
 
-        portrait = overlay.copy()
-        portrait[:, 0] = (portrait[:, 0] - cx) / ext
-        portrait[:, 1] = (portrait[:, 1] - cy) / ext
+        portrait = np.empty_like(overlay)
+        portrait[:, 0] = (iso_x - cx) / ext
+        portrait[:, 1] = (iso_y - cy) / ext
         # depth: MediaPipe lm.z is not in the same units as x/y, so scale it
         # into a fixed fraction of the face width, centered on the face and
         # negated so the nose points toward the portrait camera (-z = near).
@@ -865,12 +885,20 @@ class GLBRenderer:
             f3 = MP_TO_PORTRAIT[:3, :3]
             model = np.eye(4, dtype="f4")
             model[:3, :3] = f3 @ delta @ f3
+            # Rebalance the rotation per axis: yaw reads too weak and pitch
+            # too strong on a near-flat face cloud. Decompose -> scale ->
+            # recompose (small angles, euler is branch-stable here).
+            e = Rotation.from_matrix(model[:3, :3]).as_euler("xyz")
+            e[0] *= PORTRAIT_PITCH_GAIN
+            e[1] *= PORTRAIT_YAW_GAIN
+            e[2] *= PORTRAIT_ROLL_GAIN
+            model[:3, :3] = Rotation.from_euler("xyz", e).as_matrix().astype("f4")
             # create_translation_matrix writes a row-vector matrix (translation in
             # the last row); transpose it into the column-vector convention
             # used everywhere else (translation in the last column), or the
             # camera offset lands in W and distance only changes clipping.
             view_p = create_translation_matrix(0.0, 0.0, -PORTRAIT_CAM_DIST).T
-            proj_p = self._make_projection(PORTRAIT_FOV, aspect=1.0)
+            proj_p = self._make_projection(PORTRAIT_FOV, aspect=self.portrait_aspect)
             self.point_prog["u_model"].write(model.T.tobytes())
             self.point_prog["u_view"].write(view_p.T.tobytes())
             self.point_prog["u_proj"].write(proj_p.T.tobytes())
@@ -879,9 +907,9 @@ class GLBRenderer:
             self.ctx.disable(moderngl.BLEND)
             if DEBUG:
                 raw_p = self.portrait_fbo.read(components=3)
+                pw, ph = self.portrait_size
                 self.last_portrait = np.frombuffer(
-                    raw_p, dtype=np.uint8).reshape(
-                        PORTRAIT_RES, PORTRAIT_RES, 3)
+                    raw_p, dtype=np.uint8).reshape(ph, pw, 3)
                 self.last_portrait = np.flipud(self.last_portrait.copy())
 
         self.fbo.use()
