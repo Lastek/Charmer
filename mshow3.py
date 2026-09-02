@@ -202,7 +202,9 @@ PORTRAIT_NECK_Z = 0 # 0.20
 NECK_TO_FACE_METRIC = (0.0, 1.5, -3.0)
 HOLO_TINT = (0.30, 0.80, 1.00)
 PANEL_BASE_ALPHA = 0.15
-GLOW_STRENGTH = 0.55                     # bloom add-back strength (0 = off)
+GLOW_STRENGTH = 4.7                      # bloom add-back strength (0 = off)
+BLOOM_DIV = 16                            # bloom downsample factor (wider = softer)
+BLOOM_RADIUS = 12.0                       # gaussian sigma in downsampled pixels
 PORTRAIT_POINT_SIZE = 5.0
 OVERLAY_POINT_SIZE = 3.0
 
@@ -627,27 +629,46 @@ void main() {
 }
 """
 
-BLUR_FRAG_SHADER = """
+DOWNSAMPLE_FRAG_SHADER = """
 #version 330
 uniform sampler2D u_tex;
-uniform vec2 u_dir;   // (1,0) horizontal, (0,1) vertical
-uniform vec2 u_res;   // texture size in pixels
+uniform vec2 u_res;   // source (full-res) size in pixels
 
 in vec2 v_uv;
 out vec4 fragColor;
 
 void main() {
-    vec2 step = u_dir / u_res;
-    vec3 acc = texture(u_tex, v_uv).rgb * 0.227027;
-    acc += texture(u_tex, v_uv + step).rgb * 0.1945946;
-    acc += texture(u_tex, v_uv - step).rgb * 0.1945946;
-    acc += texture(u_tex, v_uv + step * 2.0).rgb * 0.1216216;
-    acc += texture(u_tex, v_uv - step * 2.0).rgb * 0.1216216;
-    acc += texture(u_tex, v_uv + step * 3.0).rgb * 0.054054;
-    acc += texture(u_tex, v_uv - step * 3.0).rgb * 0.054054;
-    acc += texture(u_tex, v_uv + step * 4.0).rgb * 0.016216;
-    acc += texture(u_tex, v_uv - step * 4.0).rgb * 0.016216;
-    fragColor = vec4(acc, 1.0);
+    vec2 d = 1.0 / u_res;
+    vec3 acc = vec3(0.0);
+    for (int y = -1; y <= 2; y++)
+        for (int x = -1; x <= 2; x++)
+            acc += texture(u_tex, v_uv + vec2(float(x), float(y)) * d).rgb;
+    fragColor = vec4(acc / 16.0, 1.0);
+}
+"""
+
+BLUR_FRAG_SHADER = """
+#version 330
+uniform sampler2D u_tex;
+uniform vec2 u_res;      // texture size in pixels
+uniform float u_radius;  // gaussian sigma, in pixels
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+    vec2 step = 1.0 / u_res;
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    int R = int(min(u_radius * 2.0, 16.0) + 0.5);
+    for (int y = -R; y <= R; y++) {
+        for (int x = -R; x <= R; x++) {
+            float w = exp(-0.5 * float(x * x + y * y) / (u_radius * u_radius));
+            acc += texture(u_tex, v_uv + vec2(float(x), float(y)) * step).rgb * w;
+            wsum += w;
+        }
+    }
+    fragColor = vec4(acc / max(wsum, 0.0001), 1.0);
 }
 """
 
@@ -736,7 +757,10 @@ class GLBRenderer:
         self._setup_bloom()
 
     def _setup_bloom(self):
-        # Post-process program + fullscreen quad for the glow/bloom passes.
+        # Post-process programs + fullscreen quad for the glow/bloom passes.
+        self.post_down_prog = self.ctx.program(
+            vertex_shader=POST_VERT_SHADER, fragment_shader=DOWNSAMPLE_FRAG_SHADER
+        )
         self.post_blur_prog = self.ctx.program(
             vertex_shader=POST_VERT_SHADER, fragment_shader=BLUR_FRAG_SHADER
         )
@@ -745,6 +769,9 @@ class GLBRenderer:
         )
         quad = np.array([(-1, -1), (-1, 1), (1, -1), (1, 1)], dtype="f4")
         self.post_vbo = self.ctx.buffer(quad.tobytes())
+        self.post_down_vao = self.ctx.vertex_array(
+            self.post_down_prog, [(self.post_vbo, "2f", "in_position")]
+        )
         self.post_blur_vao = self.ctx.vertex_array(
             self.post_blur_prog, [(self.post_vbo, "2f", "in_position")]
         )
@@ -753,33 +780,33 @@ class GLBRenderer:
         )
 
     def _render_bloom(self):
-        """Two-pass separable gaussian blur of the portrait, added back
-        additively for a soft glow. Reads portrait_tex, writes through two
-        scratch FBOs, lands on portrait_fbo."""
+        """Downsample the portrait, run a wide gaussian at low res, then add
+        it back additively (LINEAR upsample spreads light around the points).
+        Reads portrait_tex, writes bloom_low/bloom_blur, lands on portrait_fbo."""
         pw, ph = self.portrait_size
-        u_res = (pw, ph)
-        p = self.post_blur_prog
-        p["u_res"].value = u_res
 
-        # horizontal blur: portrait -> blur_tmp
-        self.blur_tmp_fbo.use()
+        # downsample (box 4x4): portrait (full) -> bloom_low
+        self.bloom_low_fbo.use()
         self.portrait_tex.use(0)
-        p["u_tex"].value = 0
-        p["u_dir"].value = (1.0, 0.0)
+        d = self.post_down_prog
+        d["u_tex"].value = 0
+        d["u_res"].value = (pw, ph)
+        self.post_down_vao.render(moderngl.TRIANGLE_STRIP)
+
+        # 2D gaussian at low res: bloom_low -> bloom_blur
+        self.bloom_blur_fbo.use()
+        self.bloom_low_tex.use(0)
+        b = self.post_blur_prog
+        b["u_tex"].value = 0
+        b["u_res"].value = self.bloom_size
+        b["u_radius"].value = BLOOM_RADIUS
         self.post_blur_vao.render(moderngl.TRIANGLE_STRIP)
 
-        # vertical blur: blur_tmp -> bloom
-        self.bloom_fbo.use()
-        self.blur_tmp_tex.use(0)
-        p["u_tex"].value = 0
-        p["u_dir"].value = (0.0, 1.0)
-        self.post_blur_vao.render(moderngl.TRIANGLE_STRIP)
-
-        # additive combine back onto the portrait
+        # additive add-back (LINEAR upsample) onto the portrait
         self.portrait_fbo.use()
         self.ctx.enable(moderngl.BLEND)
         self.ctx.blend_func = (moderngl.ONE, moderngl.ONE)
-        self.bloom_tex.use(0)
+        self.bloom_blur_tex.use(0)
         a = self.post_add_prog
         a["u_tex"].value = 0
         a["u_strength"].value = GLOW_STRENGTH
@@ -802,14 +829,16 @@ class GLBRenderer:
         self.portrait_fbo = self.ctx.framebuffer(
             color_attachments=[self.portrait_tex]
         )
-        # Bloom intermediates (same size): horizontal blur -> vertical blur.
-        self.blur_tmp_tex = self.ctx.texture(self.portrait_size, 4)
-        self.blur_tmp_fbo = self.ctx.framebuffer(
-            color_attachments=[self.blur_tmp_tex]
+        # Bloom at reduced resolution: spreading light is cheap and soft
+        # at low res, then upsamples (LINEAR) when added back.
+        self.bloom_size = (max(pw // BLOOM_DIV, 1), max(ph // BLOOM_DIV, 1))
+        self.bloom_low_tex = self.ctx.texture(self.bloom_size, 4)
+        self.bloom_low_fbo = self.ctx.framebuffer(
+            color_attachments=[self.bloom_low_tex]
         )
-        self.bloom_tex = self.ctx.texture(self.portrait_size, 4)
-        self.bloom_fbo = self.ctx.framebuffer(
-            color_attachments=[self.bloom_tex]
+        self.bloom_blur_tex = self.ctx.texture(self.bloom_size, 4)
+        self.bloom_blur_fbo = self.ctx.framebuffer(
+            color_attachments=[self.bloom_blur_tex]
         )
 
     def _setup_fbo(self, w, h):
