@@ -1,5 +1,5 @@
 # Environment
-Invoke `conda activate media` to run the python code.
+Invoke `conda activate media` to before running the python code.
 All dependencies are in the conda env named `media`
 
 # What is this project
