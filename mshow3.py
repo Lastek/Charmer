@@ -536,7 +536,6 @@ void main() {
 POINT_FRAG_SHADER = """
 #version 330
 uniform vec3 u_tint;
-uniform float u_time;
 uniform float u_holo;   // 1.0 = holographic styling, 0.0 = flat 2D overlay
 
 in vec3 v_color;
@@ -546,12 +545,9 @@ void main() {
     // round, soft-edged point sprite
     float d = length(gl_PointCoord - 0.5) * 2.0;
     float a = smoothstep(1.0, 0.5, d);
-    vec3 col = v_color;
-    if (u_holo > 0.5) {
-        float scan    = 0.85 + 0.15 * sin(gl_FragCoord.y * 0.8 - u_time * 6.0);
-        float flicker = 0.92 + 0.08 * sin(u_time * 47.0) * sin(u_time * 13.7);
-        col = v_color * u_tint * scan * flicker;
-    }
+    // Only the tint here: scanlines/flicker are applied AFTER bloom (see
+    // HOLO_FINISH_FRAG_SHADER), so the bloom doesn't pulse with the flicker.
+    vec3 col = mix(v_color, v_color * u_tint, u_holo);
     fragColor = vec4(col, a);
 }
 """
@@ -687,6 +683,24 @@ void main() {
 }
 """
 
+HOLO_FINISH_FRAG_SHADER = """
+#version 330
+uniform sampler2D u_tex;
+uniform float u_time;
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+void main() {
+    // Scanlines + flicker applied AFTER bloom, so the glow is steady and
+    // only the finished image pulses.
+    vec4 c = texture(u_tex, v_uv);
+    float scan    = 0.85 + 0.15 * sin(gl_FragCoord.y * 0.8 - u_time * 6.0);
+    float flicker = 0.92 + 0.08 * sin(u_time * 47.0) * sin(u_time * 13.7);
+    fragColor = vec4(c.rgb * scan * flicker, c.a);
+}
+"""
+
 
 class GLBRenderer:
     def __init__(self, glb_path, head_path, width, height):
@@ -767,6 +781,9 @@ class GLBRenderer:
         self.post_add_prog = self.ctx.program(
             vertex_shader=POST_VERT_SHADER, fragment_shader=BLOOM_ADD_FRAG_SHADER
         )
+        self.post_finish_prog = self.ctx.program(
+            vertex_shader=POST_VERT_SHADER, fragment_shader=HOLO_FINISH_FRAG_SHADER
+        )
         quad = np.array([(-1, -1), (-1, 1), (1, -1), (1, 1)], dtype="f4")
         self.post_vbo = self.ctx.buffer(quad.tobytes())
         self.post_down_vao = self.ctx.vertex_array(
@@ -777,6 +794,9 @@ class GLBRenderer:
         )
         self.post_add_vao = self.ctx.vertex_array(
             self.post_add_prog, [(self.post_vbo, "2f", "in_position")]
+        )
+        self.post_finish_vao = self.ctx.vertex_array(
+            self.post_finish_prog, [(self.post_vbo, "2f", "in_position")]
         )
 
     def _render_bloom(self):
@@ -814,6 +834,15 @@ class GLBRenderer:
         self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
         self.ctx.disable(moderngl.BLEND)
 
+    def _render_finish(self):
+        """Scanlines + flicker over the bloomed portrait -> final texture."""
+        self.portrait_final_fbo.use()
+        self.portrait_tex.use(0)
+        f = self.post_finish_prog
+        f["u_tex"].value = 0
+        f["u_time"].value = time.monotonic() % 100.0
+        self.post_finish_vao.render(moderngl.TRIANGLE_STRIP)
+
     def _setup_portrait_fbo(self):
         # Size the offscreen target to the panel's pixel aspect so the
         # content is never squashed horizontally/vertically when the
@@ -839,6 +868,11 @@ class GLBRenderer:
         self.bloom_blur_tex = self.ctx.texture(self.bloom_size, 4)
         self.bloom_blur_fbo = self.ctx.framebuffer(
             color_attachments=[self.bloom_blur_tex]
+        )
+        # Finished portrait: points + bloom, with scan/flicker applied last.
+        self.portrait_final_tex = self.ctx.texture(self.portrait_size, 4)
+        self.portrait_final_fbo = self.ctx.framebuffer(
+            color_attachments=[self.portrait_final_tex]
         )
 
     def _setup_fbo(self, w, h):
@@ -1078,14 +1112,15 @@ class GLBRenderer:
             self.point_prog["u_proj"].write(proj_p.T.tobytes())
             self.point_prog["u_point_size"].value = PORTRAIT_POINT_SIZE
             self.point_prog["u_tint"].value = HOLO_TINT
-            self.point_prog["u_time"].value = time.monotonic() % 100.0
             self.point_prog["u_holo"].value = 1.0
             self.face_portrait_vao.render(moderngl.POINTS)
             self.ctx.disable(moderngl.BLEND)
             if self.glow:
                 self._render_bloom()
+            # Scanlines + flicker last (after bloom), so the glow is steady.
+            self._render_finish()
             if DEBUG:
-                raw_p = self.portrait_fbo.read(components=3)
+                raw_p = self.portrait_final_fbo.read(components=3)
                 pw, ph = self.portrait_size
                 self.last_portrait = np.frombuffer(
                     raw_p, dtype=np.uint8).reshape(ph, pw, 3)
@@ -1182,7 +1217,7 @@ class GLBRenderer:
         if show_portrait:
             self.ctx.disable(moderngl.DEPTH_TEST)
             self.ctx.enable(moderngl.BLEND)
-            self.portrait_tex.use(0)
+            self.portrait_final_tex.use(0)
             self.holo_prog["u_holo_tex"].value = 0
             self.holo_prog["u_tint"].value = HOLO_TINT
             self.holo_prog["u_base_alpha"].value = PANEL_BASE_ALPHA
@@ -1293,10 +1328,6 @@ def main():
                                   f"max={zr[1]:+.4f} (range={zr[1]-zr[0]:.4f})")
 
                     if DEBUG:
-                        original_small = cv2.resize(original, (320, 240))
-                        denoised_debug = cv2.resize(frame, (320, 240))
-                        combined = np.hstack([original_small, denoised_debug])
-                        cv2.imshow("Denoise Debug", combined)
                         cv2.imshow("FBO", fbo_debug)
                         if getattr(renderer, "last_portrait", None) is not None:
                             cv2.imshow("Portrait FBO", renderer.last_portrait)

@@ -5,3 +5,5 @@ IRCapture/bin
 IRCapture/obj
 UAP/lib
 *.pyc
+.opencode/sessions/
+__pycache__
