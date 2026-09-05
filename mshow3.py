@@ -183,13 +183,13 @@ GHOST_ALPHA = 0.3
 PORTRAIT_RES = 384                          # offscreen FBO height (px)
 PANEL_RECT = (0.35, -0.95, 0.95, 0.35)      # NDC: left, bottom, right, top
 PORTRAIT_CAM_DIST = 3.0                     # portrait camera distance
-PORTRAIT_FOV = 60.0
+PORTRAIT_FOV = 56.0
 PORTRAIT_FIT = 2.3                          # extra margin around x/y only
-PORTRAIT_DEPTH = 0.5                        # face depth (z span) relative to size
+PORTRAIT_DEPTH = 0.9                        # face depth (z span) relative to size
 # Per-axis head-rotation gain. Yaw (turn left/right) barely moves the nose
 # (it sits near the centroid), while pitch (nod) swings the chin/forehead
 # through a lot of depth; tune these independently to balance the feel.
-PORTRAIT_YAW_GAIN = 5.0
+PORTRAIT_YAW_GAIN = 3.0
 PORTRAIT_PITCH_GAIN = 0.5
 PORTRAIT_ROLL_GAIN = 1.0
 # Neck pivot: the face center sits this far above (y) and forward (z) of the
@@ -201,10 +201,10 @@ PORTRAIT_NECK_Z = 0 # 0.20
 # hat/ghost GLBs are loaded, so it only affects the (currently blank) GLBs.
 NECK_TO_FACE_METRIC = (0.0, 1.5, -3.0)
 HOLO_TINT = (0.30, 0.80, 1.00)
-PANEL_BASE_ALPHA = 0.15
+PANEL_BASE_ALPHA = 0.85
 GLOW_STRENGTH = 4.7                      # bloom add-back strength (0 = off)
-BLOOM_DIV = 16                            # bloom downsample factor (wider = softer)
-BLOOM_RADIUS = 12.0                       # gaussian sigma in downsampled pixels
+BLOOM_DIV = 6                            # bloom downsample factor (wider = softer)
+BLOOM_RADIUS = 56.0                       # gaussian sigma in downsampled pixels
 PORTRAIT_POINT_SIZE = 5.0
 OVERLAY_POINT_SIZE = 3.0
 
@@ -1290,10 +1290,13 @@ def main():
         min_tracking_confidence=0.85,
         result_callback=landmarkerAsyncCallback
     )
-
+    fps = 0
+    frame_count = 0
+    old_time = 0
+    new_time = 0
+    start_time = time.monotonic_ns()//1_000_000 
     try:
         with vision.FaceLandmarker.create_from_options(options) as landmarker:
-            frame_count = 0
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
@@ -1301,6 +1304,7 @@ def main():
                 original = frame.copy()
                 mp_image = create_mediapipe_image(frame)
                 timestamp_ms = time.monotonic_ns()//1_000_000
+                new_time = timestamp_ms
                 landmarker.detect_async(mp_image, timestamp_ms)
                 if LANDMARKER_RESULT and LANDMARKER_RESULT.facial_transformation_matrixes:
                     results = LANDMARKER_RESULT
@@ -1331,10 +1335,15 @@ def main():
                         cv2.imshow("FBO", fbo_debug)
                         if getattr(renderer, "last_portrait", None) is not None:
                             cv2.imshow("Portrait FBO", renderer.last_portrait)
-
+                
+                fps = (new_time-old_time)
+                frame = cv2.putText(frame, f"{fps}", (32, 32), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
                 cv2.imshow("AR 3D Model", frame)
                 if cv2.waitKey(5) & 0xFF == ord("q"):
                     break
+                old_time = timestamp_ms 
+                frame_count=0
+            
     finally:
         cv2.destroyAllWindows()
         cap.release()
